@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#050508">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="manifest" href="manifest.json">
+<title>PupilLens v3</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#050508;--surf:#0d0d18;--surf2:#141425;
+  --border:rgba(100,160,255,.13);--accent:#4af0c8;
+  --accent2:#7b8fff;--accent3:#ff6b9d;--warn:#ffb347;
+  --text:#e8eaf6;--dim:#5a6090;
+  --mono:'Space Mono',monospace;--sans:'Syne',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);overflow:hidden}
+@supports (-webkit-touch-callout:none){
+  html,body{overflow:auto;height:-webkit-fill-available}
+  #app{height:-webkit-fill-available}
+}
+
+/* Flash overlay — position:fixed, covers everything, no transition */
+#flash{position:fixed;inset:0;z-index:999;pointer-events:none;opacity:0;background:#fff}
+
+#app{display:grid;grid-template-rows:50px 1fr;grid-template-columns:1fr 340px;height:100vh}
+@media(max-width:700px){
+  #app{grid-template-columns:1fr;grid-template-rows:50px 1fr 1fr}
+  #panel{border-left:none;border-top:1px solid var(--border)}
+}
+
+header{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 18px;background:var(--surf);border-bottom:1px solid var(--border);z-index:5}
+.logo{font-size:17px;font-weight:800;color:var(--accent);letter-spacing:-.5px}
+.logo span{color:var(--dim);font-weight:400}
+.v3badge{font-family:var(--mono);font-size:10px;background:var(--accent);color:#071a14;padding:2px 5px;border-radius:3px}
+.pill{margin-left:auto;display:flex;align-items:center;gap:6px;padding:4px 11px;border-radius:20px;background:var(--surf2);border:1px solid var(--border);font-family:var(--mono);font-size:11px;color:var(--dim)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--dim);transition:background .3s}
+.dot.on{background:var(--accent);box-shadow:0 0 7px var(--accent)}
+.dot.warn{background:var(--warn);box-shadow:0 0 7px var(--warn)}
+.dot.trial{background:var(--accent3);box-shadow:0 0 7px var(--accent3)}
+
+/* Camera */
+#cam{position:relative;background:#000;overflow:hidden;transition:height .35s ease}
+#video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:3}
+
+/* Trial strip */
+#cam.trial{height:64px !important}
+#strip{display:none;position:absolute;inset:0;z-index:10;background:rgba(0,0,0,.6);align-items:center;gap:10px;padding:0 14px;pointer-events:none}
+#cam.trial #strip{display:flex}
+.sdot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:sb 1s ease-in-out infinite;flex-shrink:0}
+@keyframes sb{0%,100%{opacity:.2}50%{opacity:1}}
+#sPhase{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:1px}
+#sVals{font-family:var(--mono);font-size:12px;color:var(--accent);margin-left:auto}
+
+/* Splash */
+#splash{position:absolute;inset:0;background:linear-gradient(150deg,rgba(5,5,8,.97),rgba(8,8,22,.95));display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;text-align:center;padding:36px;z-index:20;transition:opacity .4s,visibility .4s}
+#splash.gone{opacity:0;visibility:hidden}
+.eye-icon{width:76px;height:76px;border-radius:50%;background:radial-gradient(circle,rgba(74,240,200,.12),transparent 70%);border:1px solid rgba(74,240,200,.25);display:flex;align-items:center;justify-content:center;font-size:32px;animation:float 3s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+#splash h2{font-size:24px;font-weight:800;line-height:1.2}
+#splash p{color:var(--dim);font-size:13px;line-height:1.6;max-width:270px}
+.btn-start{padding:13px 30px;background:var(--accent);color:#071a14;border:none;border-radius:8px;font-family:var(--sans);font-size:14px;font-weight:700;cursor:pointer;transition:all .2s}
+.btn-start:hover{transform:translateY(-2px);box-shadow:0 8px 22px rgba(74,240,200,.28)}
+.btn-start:disabled{opacity:.5;transform:none;cursor:default}
+.hint{font-family:var(--mono);font-size:11px;color:var(--dim);border:1px solid var(--border);border-radius:6px;padding:7px 13px;line-height:1.6;text-align:left}
+#lbar{position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--accent2));display:none;z-index:40}
+#lbar.on{display:block;animation:ls 1.1s ease-in-out infinite}
+@keyframes ls{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+#toast{position:absolute;bottom:16px;left:50%;transform:translateX(-50%) translateY(60px);background:rgba(255,107,157,.14);border:1px solid var(--accent3);border-radius:8px;padding:9px 16px;font-family:var(--mono);font-size:12px;color:var(--accent3);transition:transform .3s;white-space:nowrap;z-index:50}
+#toast.show{transform:translateX(-50%) translateY(0)}
+
+/* Panel */
+#panel{background:var(--surf);border-left:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column;-webkit-overflow-scrolling:touch}
+#panel::-webkit-scrollbar{width:3px}
+#panel::-webkit-scrollbar-thumb{background:var(--border)}
+.sec{padding:14px 16px;border-bottom:1px solid var(--border);flex-shrink:0}
+.slbl{font-family:var(--mono);font-size:10px;letter-spacing:1.4px;color:var(--dim);text-transform:uppercase;margin-bottom:10px}
+
+/* Eye cards */
+.eye-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.ecard{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center;position:relative;overflow:hidden;transition:opacity .2s}
+.ecard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.ecard.L::before{background:var(--accent2)}.ecard.R::before{background:var(--accent3)}
+.elbl{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:6px}
+.ering{width:50px;height:50px;border-radius:50%;background:#0a0a1e;border:2px solid var(--accent2);margin:0 auto 5px;display:flex;align-items:center;justify-content:center}
+.ecard.R .ering{border-color:var(--accent3)}
+.epupil{border-radius:50%;background:#000;transition:width .12s,height .12s}
+.epct{font-size:19px;font-weight:800;letter-spacing:-1px;line-height:1}
+.eunit{font-family:var(--mono);font-size:9px;color:var(--dim)}
+/* Change indicator */
+.edelta{font-family:var(--mono);font-size:10px;margin-top:3px;transition:color .3s}
+.edelta.up{color:var(--accent)}.edelta.dn{color:var(--accent3)}.edelta.flat{color:var(--dim)}
+
+/* Aniso */
+.abar{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.ahead{display:flex;justify-content:space-between;margin-bottom:6px}
+.albl{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.aval{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--accent);transition:color .3s}
+.aval.w{color:var(--warn)}.aval.a{color:var(--accent3)}
+.atrack{height:4px;border-radius:2px;background:var(--surf);overflow:hidden}
+.afill{height:100%;border-radius:2px;background:var(--accent);transition:width .3s}
+.afill.w{background:var(--warn)}.afill.a{background:var(--accent3)}
+.aticks{display:flex;justify-content:space-between;margin-top:3px;font-family:var(--mono);font-size:9px;color:var(--dim)}
+
+/* Quality row */
+.qrow{display:flex;gap:5px;margin-top:8px;flex-wrap:wrap}
+.qbadge{font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:var(--surf2);border:1px solid var(--border);color:var(--dim)}
+.qbadge.ok{border-color:var(--accent);color:var(--accent)}
+.qbadge.w{border-color:var(--warn);color:var(--warn)}
+.qbadge.bad{border-color:var(--accent3);color:var(--accent3)}
+
+/* Raw debug */
+.rawrow{font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:6px;line-height:1.9}
+.rawval{color:var(--accent)}
+
+/* Waveform */
+#wcanvas{width:100%;height:64px;display:block;border-radius:6px;background:var(--surf2);border:1px solid var(--border)}
+
+/* PLR */
+.phrow{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:10px}
+.pcard{background:var(--surf2);border:1px solid var(--border);border-radius:7px;padding:7px 4px;text-align:center}
+.pcard.active{border-color:var(--accent3);background:rgba(255,107,157,.05)}
+.pcard.done{border-color:var(--accent);background:rgba(74,240,200,.04)}
+.picon{font-size:14px;margin-bottom:2px}
+.pname{font-family:var(--mono);font-size:9px;color:var(--dim)}
+
+.srow{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.slbl2{font-family:var(--mono);font-size:10px;color:var(--dim);width:86px;flex-shrink:0}
+input[type=range]{flex:1;accent-color:var(--accent);cursor:pointer}
+.sval{font-family:var(--mono);font-size:11px;color:var(--accent);width:44px;text-align:right}
+
+.btn-trial{width:100%;padding:11px;border:1px solid rgba(74,240,200,.3);border-radius:8px;background:rgba(74,240,200,.07);color:var(--accent);font-family:var(--mono);font-size:12px;letter-spacing:.5px;cursor:pointer;transition:all .2s;margin-bottom:6px}
+.btn-trial:hover{background:rgba(74,240,200,.14);border-color:var(--accent)}
+.btn-trial:disabled{opacity:.3;cursor:default;pointer-events:none}
+.btn-trial.running{border-color:var(--accent3);color:var(--accent3);background:rgba(255,107,157,.07)}
+
+/* Results */
+table.res{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+table.res th{color:var(--dim);font-weight:400;padding:3px 5px;text-align:left;border-bottom:1px solid var(--border)}
+table.res td{padding:3px 5px;border-bottom:1px solid rgba(100,160,255,.05);color:var(--text)}
+table.res td.ok{color:var(--accent)}
+table.res td.w{color:var(--warn)}
+table.res td.bad{color:var(--accent3)}
+
+/* Log */
+#loglist{display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto}
+.lentry{background:var(--surf2);border:1px solid var(--border);border-radius:5px;padding:6px 9px;font-family:var(--mono);font-size:11px;display:grid;grid-template-columns:auto 1fr;gap:7px;animation:lin .2s}
+@keyframes lin{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.lt{color:var(--accent2)}
+
+.btnrow{display:flex;gap:6px}
+.bsm{flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surf2);color:var(--text);font-family:var(--mono);font-size:11px;cursor:pointer;transition:all .2s;text-align:center}
+.bsm:hover{border-color:var(--accent);color:var(--accent)}
+.bsm:disabled{opacity:.3;cursor:default;pointer-events:none}
+.bsm.red:hover{border-color:var(--accent3);color:var(--accent3)}
+</style>
+</head>
+<body>
+<div id="flash"></div>
+
+<div id="app">
+  <header>
+    <div class="logo">Pupil<span>Lens</span></div>
+    <span class="v3badge">v3</span>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--dim)">PLR Protocol</div>
+    <div class="pill"><div class="dot" id="dot"></div><span id="stxt">IDLE</span></div>
+  </header>
+
+  <div id="cam">
+    <div id="lbar"></div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div id="strip">
+      <div class="sdot"></div>
+      <span id="sPhase">TRACKING</span>
+      <span id="sVals">—</span>
+    </div>
+
+    <div id="splash">
+      <div class="eye-icon">👁</div>
+      <h2>PupilLens v3</h2>
+      <p>Iris tracking + PLR protocol. Tracks % change in pupil size — the real signal.</p>
+      <button class="btn-start" id="startBtn">Start Camera</button>
+      <div class="hint">· Dim room for best results<br>· 35–50 cm from screen<br>· Look straight at camera</div>
+    </div>
+    <div id="toast"></div>
+  </div>
+
+  <div id="panel">
+
+    <div class="sec">
+      <div class="slbl">Live</div>
+      <div class="eye-row">
+        <div class="ecard L" id="ecL">
+          <div class="elbl">LEFT</div>
+          <div class="ering"><div class="epupil" id="Lpupil"></div></div>
+          <div class="epct" id="Lpct">—</div>
+          <div class="eunit">iris px</div>
+          <div class="edelta flat" id="Ldelta">Δ —</div>
+        </div>
+        <div class="ecard R" id="ecR">
+          <div class="elbl">RIGHT</div>
+          <div class="ering"><div class="epupil" id="Rpupil"></div></div>
+          <div class="epct" id="Rpct">—</div>
+          <div class="eunit">iris px</div>
+          <div class="edelta flat" id="Rdelta">Δ —</div>
+        </div>
+      </div>
+      <div class="abar">
+        <div class="ahead"><span class="albl">ASYMMETRY</span><span class="aval" id="aval">—</span></div>
+        <div class="atrack"><div class="afill" id="afill" style="width:0%"></div></div>
+        <div class="aticks"><span>0</span><span>5%</span><span>10%</span><span>15%</span><span>≥20%</span></div>
+      </div>
+      <div class="qrow">
+        <span class="qbadge" id="qconf">CONF —</span>
+        <span class="qbadge" id="qear">EAR —</span>
+        <span class="qbadge" id="qtilt">TILT —</span>
+      </div>
+      <div class="rawrow">
+        L raw: <span class="rawval" id="rawL">—</span>px &nbsp;
+        R raw: <span class="rawval" id="rawR">—</span>px &nbsp;
+        EAR: <span class="rawval" id="rawEAR">—</span>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="slbl">Iris px trend (real signal)</div>
+      <canvas id="wcanvas"></canvas>
+    </div>
+
+    <div class="sec">
+      <div class="slbl">PLR Trial</div>
+      <div class="phrow">
+        <div class="pcard" id="ph-adapt"><div class="picon">🌑</div><div class="pname">ADAPT</div></div>
+        <div class="pcard" id="ph-baseline"><div class="picon">📏</div><div class="pname">BASELINE</div></div>
+        <div class="pcard" id="ph-flash"><div class="picon">⚡</div><div class="pname">FLASH</div></div>
+        <div class="pcard" id="ph-recovery"><div class="picon">🔄</div><div class="pname">RECOVERY</div></div>
+      </div>
+      <div class="srow"><span class="slbl2">DARK ADAPT</span><input type="range" id="sAdapt" min="5" max="30" value="10" step="1"><span class="sval" id="vAdapt">10s</span></div>
+      <div class="srow"><span class="slbl2">BASELINE</span><input type="range" id="sBaseline" min="2" max="10" value="5" step="1"><span class="sval" id="vBaseline">5s</span></div>
+      <div class="srow"><span class="slbl2">FLASH</span><input type="range" id="sFlash" min="100" max="800" value="250" step="50"><span class="sval" id="vFlash">250ms</span></div>
+      <div class="srow"><span class="slbl2">RECOVERY</span><input type="range" id="sRecovery" min="5" max="30" value="15" step="1"><span class="sval" id="vRecovery">15s</span></div>
+      <div class="srow">
+        <span class="slbl2">INTENSITY</span>
+        <input type="range" id="sIntensity" min="1" max="100" value="100">
+        <span class="sval" id="vIntensity">100%</span>
+      </div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--dim);margin:-4px 0 8px;padding-left:94px">
+        CIE L* = <span id="lstarDisplay" style="color:var(--accent)">100</span> → sRGB <span id="srgbDisplay" style="color:var(--accent)">255</span>
+      </div>
+      <div class="srow" style="margin-bottom:10px">
+        <span class="slbl2">HALF SCREEN</span>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;flex:1">
+          <input type="checkbox" id="halfScreenChk" style="accent-color:var(--accent);width:16px;height:16px">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">Flash right half only (reduces auto-exposure shift)</span>
+        </label>
+      </div>
+      <button class="btn-trial" id="trialBtn" disabled>▶ START PLR TRIAL</button>
+      <button class="btn-trial" id="colorBtn" disabled style="font-size:11px;padding:8px">🌈 COLOR SWEEP (R→G→B→W)</button>
+    </div>
+
+    <div class="sec" id="resSection" style="display:none">
+      <div class="slbl">Results</div>
+      <div style="overflow-x:auto">
+        <table class="res"><thead><tr><th>Metric</th><th>Left</th><th>Right</th><th>Normal</th></tr></thead>
+        <tbody id="resTbody"></tbody></table>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="slbl" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Log</span>
+        <button class="bsm" style="flex:none;padding:3px 8px;font-size:10px" id="snapBtn" disabled>● SNAP</button>
+      </div>
+      <div id="loglist"></div>
+    </div>
+
+    <div class="sec">
+      <div class="btnrow">
+        <button class="bsm" id="exportBtn">↓ Trial CSV</button>
+        <button class="bsm red" id="clearBtn">✕ Clear</button>
+        <button class="bsm red" id="stopBtn" disabled>■ Stop</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Proven stack: MediaPipe runtime via TF.js wrapper — load in exact order -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.17.0/dist/tf-core.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.17.0/dist/tf-backend-webgl.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-detection@1.0.2/dist/face-detection.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.5/dist/face-landmarks-detection.min.js" crossorigin="anonymous"></script>
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 1: CIELAB L* → sRGB conversion
+// ───────────────────────────────────────────────────────────────────────────
+// sRGB is perceptually non-linear. A "50% intensity" sRGB gray is only ~21.4%
+// of the actual photon flux. CIE L* is designed to be perceptually uniform.
+// We convert: L* (0-100) → Y (linear luminance, 0-1) → sRGB (gamma encoded)
+
+function labLstarToLinear(L){
+  // CIE standard: Y = ((L+16)/116)^3 for L>8, else Y = L/903.3
+  return L>8 ? Math.pow((L+16)/116, 3) : L/903.3;
+}
+function linearToSRGB(u){
+  // IEC 61966-2-1 sRGB gamma encoding
+  return u<=0.0031308 ? 12.92*u : 1.055*Math.pow(u,1/2.4)-0.055;
+}
+function labLstarToSRGBhex(Lstar){
+  const Y=labLstarToLinear(Math.max(0,Math.min(100,Lstar)));
+  const c=Math.round(Math.min(1,Math.max(0,linearToSRGB(Y)))*255);
+  return `rgb(${c},${c},${c})`;
+}
+// Precomputed reference table for UI display
+function sRGBtoLstar(srgb0_1){
+  // inverse: sRGB → linear → L*
+  const u=srgb0_1<=0.04045?srgb0_1/12.92:Math.pow((srgb0_1+0.055)/1.055,2.4);
+  return u>0.008856?116*Math.pow(u,1/3)-16:903.3*u;
+}
+
+// Radial distortion correction removed — mean radius approach is more robust
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 3: Camera exposure metadata capture
+// ───────────────────────────────────────────────────────────────────────────
+// If the camera auto-exposure changes during a flash, what looks like pupil
+// constriction might be the camera stopping down. We log shutter/ISO/gain
+// to the CSV header so you can identify and discard affected frames.
+
+let camSettings={exposureTime:null,iso:null,frameRate:null};
+
+function refreshCamSettings(){
+  try{
+    const track=video.srcObject?.getVideoTracks()?.[0];
+    if(!track)return;
+    const s=track.getSettings();
+    camSettings.exposureTime = s.exposureTime||null;  // microseconds
+    camSettings.iso          = s.iso||null;
+    camSettings.frameRate    = s.frameRate||null;
+  }catch(e){/* not available on all browsers */}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 4: Half-screen flash (prevents auto-exposure washout)
+// ───────────────────────────────────────────────────────────────────────────
+// Flashing the full screen causes camera auto-exposure to adjust, washing out
+// the pupil. Flash only the half of screen AWAY from the camera (right half
+// for selfie view, since the camera feed is mirrored). The eye still receives
+// the consensual PLR stimulus via the peripheral field.
+//
+// We implement this by constraining flashEl width to 50% and aligning it
+// to whichever side doesn't overlap the iris region.
+
+function setFlashRegion(fullScreen){
+  if(fullScreen){
+    flashEl.style.left='0';flashEl.style.width='100%';
+  }else{
+    // Flash the right half (away from center where face appears)
+    flashEl.style.left='50%';flashEl.style.width='50%';
+  }
+}
+
+// ── State ─────────────────────────────────────────────────────────────────
+const S={
+  running:false, detector:null, lastT:-1, frameCount:0,
+  smoothLpx:null, smoothRpx:null,
+  baselineLpx:null, baselineRpx:null,   // set during baseline phase
+  hist:{l:[],r:[]}, samples:[], trialData:[],
+  lastResults:null, trialRunning:false,
+};
+let currentPhase='';
+
+// ── DOM ───────────────────────────────────────────────────────────────────
+const $=id=>document.getElementById(id);
+const video=$('video'), canvas=$('overlay'), ctx=canvas.getContext('2d');
+const wcanvas=$('wcanvas'), wctx=wcanvas.getContext('2d');
+const flashEl=$('flash');
+
+const setStatus=(t,m='')=>{$('stxt').textContent=t;$('dot').className='dot'+(m?' '+m:'');};
+const toast=msg=>{const t=$('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3200);};
+const ema=(p,v,a=0.22)=>p===null?v:p*(1-a)+v*a;
+// repaint: wait for two animation frames so browser actually paints before we proceed
+const repaint=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+const delay=ms=>new Promise(r=>setTimeout(r,ms));
+
+// ── Camera ────────────────────────────────────────────────────────────────
+async function startCamera(){
+  const stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}}
+  });
+  video.srcObject=stream;
+  return new Promise((res,rej)=>{
+    video.onloadedmetadata=()=>{video.play();res();};
+    video.onerror=rej;
+  });
+}
+
+// ── Model ─────────────────────────────────────────────────────────────────
+async function loadModel(){
+  S.detector = await faceLandmarksDetection.createDetector(
+    faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
+    {
+      runtime: 'mediapipe',
+      solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619',
+      refineLandmarks: true,
+      maxFaces: 1,
+    }
+  );
+}
+
+// ── Iris radius: mean distance from center to 4 edge landmarks ──────────────
+// Simpler and more robust than Kasa algebraic fit.
+// Iris landmarks: center=ci, edges=es,es+1,es+2,es+3
+function irisRadius(kps, ci, es){
+  let s=0;
+  for(let i=es;i<es+4;i++) s+=Math.hypot(kps[i].x-kps[ci].x, kps[i].y-kps[ci].y);
+  return s/4;
+}
+
+// ── Pupil measurement: threshold dark region inside iris circle ───────────
+// Crops a square region around the iris center from the live video frame,
+// converts to grayscale, then finds the largest contiguous dark region
+// (the pupil) by adaptive thresholding within the iris boundary.
+// Returns pupil radius in video-pixel units, or null if unreliable.
+const _pupilCanvas=document.createElement('canvas');
+const _pupilCtx=_pupilCanvas.getContext('2d',{willReadFrequently:true});
+
+function measurePupil(vid, cx, cy, irisRad){
+  if(!vid||!vid.videoWidth||irisRad<4)return null;
+  // Crop a square 2× the iris diameter, clamped to video bounds
+  const vw=vid.videoWidth, vh=vid.videoHeight;
+  const size=Math.round(irisRad*2)*2;   // even number for symmetry
+  const half=size/2;
+  // srcX/srcY: top-left corner of crop in video pixel space
+  const srcX=Math.round(cx-half), srcY=Math.round(cy-half);
+  // Bail if iris is too close to the edge to get a clean crop
+  if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh)return null;
+
+  _pupilCanvas.width=size;
+  _pupilCanvas.height=size;
+  // Draw only the cropped iris region — no full-frame copy
+  _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
+
+  const {data}=_pupilCtx.getImageData(0,0,size,size);
+  // Convert to grayscale and collect intensities within the iris circle
+  const pixels=new Uint8Array(size*size);
+  let sum=0, count=0;
+  const cx2=half, cy2=half, r2=irisRad*irisRad;
+  for(let y=0;y<size;y++){
+    for(let x=0;x<size;x++){
+      const dx=x-cx2, dy=y-cy2;
+      if(dx*dx+dy*dy>r2)continue;   // outside iris circle
+      const i=(y*size+x)*4;
+      // Rec.709 luminance weights
+      const g=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
+      pixels[y*size+x]=g;
+      sum+=g; count++;
+    }
+  }
+  if(count<16)return null;
+  const mean=sum/count;
+  // Adaptive threshold: pupil is pixels darker than 55% of mean iris luminance.
+  // This is robust to overall brightness changes (flash, room light shifts).
+  const thresh=mean*0.55;
+
+  // Count dark pixels and compute their centroid to find pupil radius
+  // Use circular moment: sqrt(dark_area / π) as radius estimate
+  let darkCount=0, darkSumX=0, darkSumY=0;
+  for(let y=0;y<size;y++){
+    for(let x=0;x<size;x++){
+      const dx=x-cx2, dy=y-cy2;
+      if(dx*dx+dy*dy>r2)continue;
+      if(pixels[y*size+x]<=thresh){
+        darkCount++;
+        darkSumX+=x; darkSumY+=y;
+      }
+    }
+  }
+  if(darkCount<4)return null;
+
+  // Radius from area: r = sqrt(A/π)
+  const pupilRad=Math.sqrt(darkCount/Math.PI);
+
+  // Sanity bounds: pupil must be 10–80% of iris radius
+  if(pupilRad<irisRad*0.10||pupilRad>irisRad*0.85)return null;
+  return pupilRad;  // in video pixel units
+}
+
+// ── Eye Aspect Ratio (blink detection) ───────────────────────────────────
+// R eye: top=159 bot=145 inner=133 outer=33
+// L eye: top=386 bot=374 inner=362 outer=263
+function earOf(kps,t,b,inn,out){
+  const v=Math.hypot(kps[t].x-kps[b].x, kps[t].y-kps[b].y);
+  const h=Math.hypot(kps[inn].x-kps[out].x, kps[inn].y-kps[out].y);
+  return h>0?v/h:0;
+}
+
+// ── Measure ───────────────────────────────────────────────────────────────
+function measure(kps){
+  if(!kps||kps.length<478)return null;
+
+  const lEAR=earOf(kps,386,374,362,263);
+  const rEAR=earOf(kps,159,145,133,33);
+  const lOpen=lEAR>0.15, rOpen=rEAR>0.15;
+
+  // Iris radius: mean distance from center landmark to 4 edge landmarks
+  // L iris: 468=center, 469=top, 470=right, 471=bottom, 472=left
+  // R iris: 473=center, 474=top, 475=right, 476=bottom, 477=left
+  const lRad=irisRadius(kps,468,469);
+  const rRad=irisRadius(kps,473,474);
+
+  // Tilt ratio + mm scale: mean radius from center to 4 edge landmarks
+  // lRad and _lMeanR are the same calculation — reuse lRad directly
+  const tiltR=(lRad>0&&rRad>0)?Math.max(lRad,rRad)/Math.min(lRad,rRad):1;
+  // Diameter for mm calibration (iris = 11.7mm population average)
+  const lHorizPx=lRad*2, rHorizPx=rRad*2;
+  const lDiamOk=lHorizPx>8&&lHorizPx<300;
+  const rDiamOk=rHorizPx>8&&rHorizPx<300;
+  const lMmPerPx=lDiamOk?11.7/lHorizPx:null;
+  const rMmPerPx=rDiamOk?11.7/rHorizPx:null;
+  // Seesaw detection: if L and R move in OPPOSITE directions by >2px it's pose drift
+  // We detect this in updateUI() using per-frame delta comparison
+  const quality=tiltR<1.4?'good':tiltR<1.7?'fair':'poor';
+  const valid=lOpen&&rOpen&&lRad>3&&rRad>3&&tiltR<2.0;
+
+  // Measure actual pupil size from video pixels using iris center as anchor
+  const lPupilPx = measurePupil(video, kps[468].x, kps[468].y, lRad);
+  const rPupilPx = measurePupil(video, kps[473].x, kps[473].y, rRad);
+
+  const lIrisMm  = lMmPerPx ? lRad*2*lMmPerPx : null;   // should ≈ 11.7mm
+  const rIrisMm  = rMmPerPx ? rRad*2*rMmPerPx : null;
+  // Pupil mm: measured radius in px × mm/px scale × 2 for diameter
+  const lPupilMm = (lPupilPx!=null&&lMmPerPx) ? lPupilPx*2*lMmPerPx : null;
+  const rPupilMm = (rPupilPx!=null&&rMmPerPx) ? rPupilPx*2*rMmPerPx : null;
+
+  return{
+    lRad,rRad,
+    lPupilPx,rPupilPx,
+    lHorizPx,rHorizPx,lDiamOk,rDiamOk,
+    lCx:kps[468].x, lCy:kps[468].y,
+    rCx:kps[473].x, rCy:kps[473].y,
+    lEAR,rEAR,lOpen,rOpen,
+    quality,tiltR,valid,
+    lPupilMm,rPupilMm,lIrisMm,rIrisMm,
+    lMmPerPx,rMmPerPx,
+  };
+}
+
+// ── Draw iris overlays ────────────────────────────────────────────────────
+function drawIrises(m){
+  const W=canvas.width,H=canvas.height;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh)return;
+  const scale=Math.max(W/vw,H/vh);
+  const offX=(W-vw*scale)/2, offY=(H-vh*scale)/2;
+  const toX=x=>W-(x*scale+offX);
+  const toY=y=>y*scale+offY;
+
+  // Use lHorizPx-derived radius for drawing (reliable, matches mm calc)
+  // lHorizPx is in video pixel space, so scale it for canvas display
+  const lDrawR = m.lHorizPx>0 ? (m.lHorizPx/2)*scale : m.lRad*scale;
+  const rDrawR = m.rHorizPx>0 ? (m.rHorizPx/2)*scale : m.rRad*scale;
+
+  const drawEye=(cx,cy,drawR,col,open)=>{
+    const px=toX(cx),py=toY(cy);
+    ctx.beginPath();ctx.arc(px,py,drawR,0,Math.PI*2);
+    ctx.strokeStyle=open?col:'rgba(255,80,80,.5)';
+    ctx.lineWidth=open?1.8:1;ctx.stroke();
+    if(open){
+      ctx.beginPath();ctx.arc(px,py,drawR*.30,0,Math.PI*2);
+      ctx.fillStyle='rgba(0,0,0,.65)';ctx.fill();
+      ctx.strokeStyle=col;ctx.lineWidth=.8;ctx.stroke();
+    }
+    ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);
+    ctx.fillStyle=col;ctx.fill();
+  };
+
+  drawEye(m.lCx,m.lCy,lDrawR,'rgba(123,143,255,.9)',m.lOpen);
+  drawEye(m.rCx,m.rCy,rDrawR,'rgba(255,107,157,.9)',m.rOpen);
+
+  // ── Targeting overlay ──────────────────────────────────────────────────
+  // Show alignment guides to help user center face and reduce tilt
+  const lx=toX(m.lCx), ly=toY(m.lCy);
+  const rx=toX(m.rCx), ry=toY(m.rCy);
+  const midX=(lx+rx)/2, midY=(ly+ry)/2;
+
+  // Tilt line between eye centers
+  const tiltAngle=Math.atan2(ry-ly,rx-lx);
+  // atan2 returns angle of line from L to R eye
+  // Near 0° or 180° = level, near 90° = head tilted sideways
+  // Normalise to deviation from horizontal (0=level)
+  const tiltDeg=Math.abs(((tiltAngle*180/Math.PI)+180)%180-0);
+  // tiltDev: how far from perfectly horizontal (0=level, 90=sideways)
+  const tiltDev=tiltDeg>90?180-tiltDeg:tiltDeg;
+  const tiltOk=tiltDev<8; // within 8 degrees of level
+
+  // Draw line between eye centers
+  ctx.beginPath();ctx.moveTo(lx,ly);ctx.lineTo(rx,ry);
+  ctx.strokeStyle=tiltOk?'rgba(74,240,200,.4)':'rgba(255,183,71,.5)';
+  ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
+
+  // Center crosshair — guides user to keep face centered
+  const cx2=W/2, cy2=H*0.42; // target zone center
+  const zone=Math.min(W,H)*0.12;
+  ctx.beginPath();ctx.arc(cx2,cy2,zone,0,Math.PI*2);
+  ctx.strokeStyle='rgba(255,255,255,.08)';ctx.lineWidth=1;ctx.stroke();
+
+  // Symmetry indicator — L and R iris size difference
+  if(m.lHorizPx>0&&m.rHorizPx>0){
+    const symRatio=Math.max(m.lHorizPx,m.rHorizPx)/Math.min(m.lHorizPx,m.rHorizPx);
+    const symOk=symRatio<1.15;
+    const barW=60, barX=W/2-barW/2, barY=H-20;
+    ctx.fillStyle='rgba(0,0,0,.4)';
+    ctx.fillRect(barX,barY-6,barW,6);
+    const fillW=Math.min(barW,(symRatio-1)*barW*3); // scale: ratio 1.33→full bar
+    ctx.fillStyle=symOk?'rgba(74,240,200,.7)':'rgba(255,183,71,.7)';
+    ctx.fillRect(barX,barY-6,fillW,6);
+    ctx.fillStyle='rgba(255,255,255,.4)';
+    ctx.font='9px Space Mono,monospace';
+    ctx.textAlign='center';
+    ctx.fillText(`sym ${symRatio.toFixed(2)}`,W/2,barY+6);
+    ctx.textAlign='left';
+  }
+
+  // Tilt warning text
+  if(!tiltOk){
+    ctx.fillStyle='rgba(255,183,71,.8)';
+    ctx.font='11px Space Mono,monospace';
+    ctx.textAlign='center';
+    ctx.fillText(`tilt ${tiltDev.toFixed(0)}°`,midX,midY-Math.max(lDrawR,rDrawR)-8);
+    ctx.textAlign='left';
+  }
+}
+
+// ── Waveform ──────────────────────────────────────────────────────────────
+function drawWave(){
+  const PR=devicePixelRatio||1;
+  wcanvas.width=wcanvas.offsetWidth*PR;
+  wcanvas.height=wcanvas.offsetHeight*PR;
+  const W=wcanvas.width,H=wcanvas.height;
+  wctx.clearRect(0,0,W,H);
+  const lh=S.hist.l,rh=S.hist.r;
+  if(lh.length<2)return;
+  const all=[...lh,...rh];
+  const mn=Math.min(...all)-.5,mx=Math.max(...all)+.5,sp=mx-mn||1;
+  const toY=v=>H*.9-((v-mn)/sp)*H*.78;
+  const toX=(i,n)=>(i/(n-1))*W;
+  wctx.strokeStyle='rgba(100,120,200,.07)';wctx.lineWidth=1;
+  for(let g=0;g<=3;g++){
+    const y=H*.1+H*.8*(g/3);
+    wctx.beginPath();wctx.moveTo(0,y);wctx.lineTo(W,y);wctx.stroke();
+  }
+  const line=(d,col)=>{
+    if(d.length<2)return;
+    wctx.beginPath();
+    d.forEach((v,i)=>{const x=toX(i,d.length),y=toY(v);i?wctx.lineTo(x,y):wctx.moveTo(x,y);});
+    wctx.strokeStyle=col;wctx.lineWidth=1.5*PR;wctx.lineJoin='round';
+    wctx.shadowBlur=4;wctx.shadowColor=col;wctx.stroke();wctx.shadowBlur=0;
+  };
+  line(lh,'#7b8fff');line(rh,'#ff6b9d');
+  wctx.font=`${9*PR}px Space Mono,monospace`;
+  wctx.fillStyle='#7b8fff';wctx.fillText('L',4*PR,11*PR);
+  wctx.fillStyle='#ff6b9d';wctx.fillText('R',15*PR,11*PR);
+}
+
+// ── UI update (only called for valid frames) ──────────────────────────────
+let _prevL=null, _prevR=null;
+function updateUI(m){
+  // Smooth on measured pupil px; fall back to iris radius if pupil detection failed
+  const rawL = m.lPupilPx!=null ? m.lPupilPx : m.lRad*0.30;
+  const rawR = m.rPupilPx!=null ? m.rPupilPx : m.rRad*0.30;
+  S.smoothLpx=ema(S.smoothLpx,rawL);
+  S.smoothRpx=ema(S.smoothRpx,rawR);
+  const L=S.smoothLpx, R=S.smoothRpx;
+
+  // Display: mm when available, pupil px otherwise
+  const showMm = m.lPupilMm!=null && m.lPupilMm>0.5 && m.lPupilMm<15;
+  if(showMm){
+    $('Lpct').textContent=m.lPupilMm.toFixed(2);
+    $('Rpct').textContent=m.rPupilMm.toFixed(2);
+    document.querySelectorAll('.eunit').forEach(el=>el.textContent='pupil mm');
+  }else{
+    $('Lpct').textContent=L.toFixed(1);
+    $('Rpct').textContent=R.toFixed(1);
+    document.querySelectorAll('.eunit').forEach(el=>el.textContent='pupil px');
+  }
+  const diagStr = `iris:${m.lHorizPx?.toFixed(0)||'?'}px ok:${m.lDiamOk?'✓':'✗'}`;
+  $('rawL').textContent=`pupil=${m.lPupilPx!=null?m.lPupilPx.toFixed(1)+'px':'—'} ${m.lPupilMm!=null?m.lPupilMm.toFixed(2)+'mm':'no mm'} iris=${m.lIrisMm!=null?m.lIrisMm.toFixed(1)+'mm':'—'}`;
+  $('rawR').textContent=`pupil=${m.rPupilPx!=null?m.rPupilPx.toFixed(1)+'px':'—'} ${m.rPupilMm!=null?m.rPupilMm.toFixed(2)+'mm':'no mm'} iris=${m.rIrisMm!=null?m.rIrisMm.toFixed(1)+'mm':'—'}`;
+  $('rawEAR').textContent=`EAR ${m.lEAR.toFixed(2)}/${m.rEAR.toFixed(2)} ${diagStr}`;
+
+  // Delta from baseline (if set) or from previous frame
+  const refL=S.baselineLpx||_prevL, refR=S.baselineRpx||_prevR;
+  let isSeesaw=false;
+  if(refL&&refR){
+    const dL=L-refL, dR=R-refR;
+    const dLpct=dL/refL*100, dRpct=dR/refR*100;
+    // Seesaw: opposite directions AND both large enough to matter
+    isSeesaw = Math.abs(dL)>1.5 && Math.abs(dR)>1.5 && (dL*dR)<0;
+    const fmtD=(d,id)=>{
+      const el=$(id);
+      el.textContent=(d>=0?'▲':'▼')+Math.abs(d/refL*100||0).toFixed(1)+'%';
+      el.className='edelta '+(Math.abs(d)<1?'flat':d>0?'up':'dn');
+    };
+    fmtD(dL,'Ldelta');fmtD(dR,'Rdelta');
+    if(isSeesaw){
+      $('qtilt').textContent='SEESAW';
+      $('qtilt').className='qbadge bad';
+    }
+  }
+  _prevL=L;_prevR=R;
+  // Skip seesaw frames from trial recording
+  if(isSeesaw && S.trialRunning) return;
+
+  // Pupil dot (represents ~30% of iris ring size)
+  const setDot=(id,rad)=>{
+    const frac=Math.min(Math.max(rad/80,.15),.85)*44;
+    const e=$(id);e.style.width=frac+'px';e.style.height=frac+'px';
+  };
+  setDot('Lpupil',L);setDot('Rpupil',R);
+
+  // Eye card opacity — dim on closed/poor
+  $('ecL').style.opacity=m.lOpen?'1':'0.4';
+  $('ecR').style.opacity=m.rOpen?'1':'0.4';
+
+  // Asymmetry as % difference between the two irises
+  const asym=Math.abs(L-R)/((L+R)/2)*100;
+  $('aval').textContent=asym.toFixed(1)+'%';
+  $('afill').style.width=Math.min((asym/20)*100,100)+'%';
+  const ac=asym>=15?'a':asym>=8?'w':'';
+  $('aval').className='aval '+ac;$('afill').className='afill '+ac;
+
+  // Quality badges
+  $('qconf').textContent='CONF ok';$('qconf').className='qbadge ok';
+  $('qear').textContent=(!m.lOpen||!m.rOpen)?'BLINK':'EAR ok';
+  $('qear').className='qbadge '+((!m.lOpen||!m.rOpen)?'bad':'ok');
+  // tiltR = iris size ratio (1.0=perfect, >1.4=misaligned)
+  $('qtilt').textContent='SYM '+m.tiltR.toFixed(2);
+  $('qtilt').className='qbadge '+(m.tiltR<1.15?'ok':m.tiltR<1.4?'w':'bad');
+
+  // History
+  S.hist.l.push(L);S.hist.r.push(R);
+  if(S.hist.l.length>120){S.hist.l.shift();S.hist.r.shift();}
+
+  S.samples.push({t:Date.now(),lPx:L,rPx:R,asym,quality:m.quality});
+
+  if(S.trialRunning&&currentPhase){
+    const now=Date.now();
+    S.trialData.push({
+      t_ms:now,
+      elapsed_ms:S.trialStartMs?now-S.trialStartMs:0,
+      phase:currentPhase,
+      trial_type:S.trialType||'PLR',
+      lPx:L,rPx:R,                          // smoothed pupil px (real signal)
+      lPupilPx:m.lPupilPx,rPupilPx:m.rPupilPx, // raw per-frame pupil px
+      lIrisRad:m.lRad,rIrisRad:m.rRad,      // iris radius px (calibration ruler)
+      lPupilMm:m.lPupilMm,rPupilMm:m.rPupilMm,
+      lIrisMm:m.lIrisMm,rIrisMm:m.rIrisMm,
+      tilt:m.tiltR,q:m.quality,
+    });
+    // Accumulate baseline
+    if(currentPhase==='baseline'){
+      const bl=S.trialData.filter(d=>d.phase==='baseline');
+      S.baselineLpx=bl.reduce((s,d)=>s+d.lPx,0)/bl.length;
+      S.baselineRpx=bl.reduce((s,d)=>s+d.rPx,0)/bl.length;
+    }
+    $('sVals').textContent=`L${L.toFixed(1)} R${R.toFixed(1)}px`;
+  }
+
+  drawWave();
+}
+
+// ── Detection loop ────────────────────────────────────────────────────────
+async function loop(){
+  if(!S.running)return;
+  if(video.readyState<2||video.currentTime===S.lastT){requestAnimationFrame(loop);return;}
+  S.lastT=video.currentTime;
+  // Refresh camera exposure settings every 30 frames
+  if(S.frameCount%30===0)refreshCamSettings();
+  canvas.width=video.clientWidth;
+  canvas.height=video.clientHeight;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  try{
+    const faces=await S.detector.estimateFaces(video,{flipHorizontal:false});
+    S.frameCount++;
+    if(faces.length){
+      let kps=faces[0].keypoints;
+      // Auto-detect normalised vs pixel coords from the mediapipe runtime.
+      // If x values are 0-1 (normalised), scale to video pixel space.
+      // Nose tip (kps[1]) is a reliable reference — in pixel space it's 300-900px.
+      if(kps.length>1 && kps[1].x < 2){
+        const vw=video.videoWidth||1280, vh=video.videoHeight||720;
+        kps=kps.map(p=>({x:p.x*vw, y:p.y*vh, z:p.z||0}));
+      }
+      const m=measure(kps);
+      if(m){
+        drawIrises(m);
+        if(m.valid){
+          updateUI(m);
+          if(!S.trialRunning)setStatus('TRACKING','on');
+        }else{
+          if(!S.trialRunning)setStatus((!m.lOpen||!m.rOpen)?'BLINK':'TILT','warn');
+          $('qconf').textContent='SKIP';$('qconf').className='qbadge w';
+        }
+      }
+    }else{
+      S.smoothLpx=null;S.smoothRpx=null;
+      $('Lpct').textContent='—';$('Rpct').textContent='—';
+      if(!S.trialRunning)setStatus('NO FACE','warn');
+    }
+  }catch(e){
+    console.error('frame error:',e);
+  }
+  requestAnimationFrame(loop);
+}
+
+// ── Flash ─────────────────────────────────────────────────────────────────
+// No CSS transitions on flashEl — instant on/off via opacity
+function flashSet(col,op){
+  flashEl.style.background=col;
+  flashEl.style.opacity=op;
+}
+
+async function doFlash(color,ms,halfScreen=false){
+  setFlashRegion(!halfScreen);
+
+  // GPU pre-warm: paint the flash color to a hidden canvas 100ms early
+  // so the GPU has the texture ready and the first visible frame is instant
+  const warm=document.createElement('canvas');
+  warm.width=2;warm.height=2;
+  const wctx2=warm.getContext('2d');
+  wctx2.fillStyle=color;wctx2.fillRect(0,0,2,2);
+
+  // 1. Black pre-frame (200ms dark baseline before stimulus)
+  flashSet('#000',1);
+  await repaint();
+  await delay(100);
+
+  // 2. Snapshot camera exposure BEFORE flash
+  refreshCamSettings();
+  const preExposure={...camSettings};
+
+  // 3. Stimulus on — instant colour change, await repaint before starting clock
+  flashSet(color,1);
+  await repaint();
+  const t0=performance.now();
+  await delay(ms);
+  const actual=Math.round(performance.now()-t0);
+
+  // 4. Snapshot exposure AFTER flash (will show if camera auto-adjusted)
+  refreshCamSettings();
+  const postExposure={...camSettings};
+
+  // Log if exposure changed during flash (potential artifact)
+  if(preExposure.exposureTime&&postExposure.exposureTime){
+    const ratio=postExposure.exposureTime/preExposure.exposureTime;
+    if(ratio<0.7||ratio>1.4){
+      console.warn(`⚠ Camera exposure changed during flash: ${preExposure.exposureTime}→${postExposure.exposureTime}μs (×${ratio.toFixed(2)})`);
+      logEntry(`⚠ CAM EXPOSURE SHIFT ×${ratio.toFixed(2)}`);
+    }
+  }
+
+  // 5. Instant cut to black
+  flashSet('#000',0);
+  await repaint();
+  setFlashRegion(true); // restore full screen
+
+  return{actual,preExposure,postExposure};
+}
+
+// ── Trial ─────────────────────────────────────────────────────────────────
+function setPhase(id,state){
+  ['adapt','baseline','flash','recovery'].forEach(p=>{
+    $('ph-'+p).className='pcard'+(p===id?' '+state:'');
+  });
+}
+
+function showCountdownFrame(i, label){
+  flashEl.style.cssText='position:fixed;inset:0;z-index:999;pointer-events:none;opacity:1;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center';
+  flashEl.innerHTML=`<div style="font:800 72px/1 Space Mono,monospace;color:rgba(74,240,200,.8)">${i}</div><div style="font:11px/1 Space Mono,monospace;color:rgba(255,255,255,.35);letter-spacing:2px;margin-top:10px">${label}</div>`;
+}
+function hideCountdown(){
+  // Fully reset flashEl to its inert state
+  flashEl.style.cssText='position:fixed;inset:0;z-index:999;pointer-events:none;opacity:0;background:#fff';
+  flashEl.innerHTML='';
+}
+async function countdown(secs,label,phaseId){
+  setPhase(phaseId,'active');
+  $('sPhase').textContent=label;
+  for(let i=secs;i>0;i--){
+    if(!S.trialRunning){hideCountdown();return false;}
+    showCountdownFrame(i,label);
+    await delay(1000);
+  }
+  hideCountdown();
+  return true;
+}
+
+async function runTrial(colorSweep=false){
+  if(S.trialRunning||!S.running)return;
+  S.trialRunning=true;S.trialData=[];currentPhase='';
+  S.trialStartMs=Date.now();
+  S.trialType=colorSweep?'COLOR_SWEEP':'PLR';
+  S.baselineLpx=null;S.baselineRpx=null;
+  // Reset EMA smoothing so trial starts from clean state
+  S.smoothLpx=null;S.smoothRpx=null;
+  _prevL=null;_prevR=null;
+  $('trialBtn').disabled=true;$('colorBtn').disabled=true;
+  $('trialBtn').classList.add('running');
+  $('cam').classList.add('trial');
+
+  const adaptSec=+$('sAdapt').value,baseSec=+$('sBaseline').value;
+  const flashMs=+$('sFlash').value,recSec=+$('sRecovery').value;
+  const intv=+$('sIntensity').value;
+  // Convert slider (0-100) → CIE L* (0-100) → linear luminance → sRGB
+  // This ensures perceived brightness matches the slider value accurately
+  const gray=labLstarToSRGBhex(intv);
+
+  // Phase 1: Dark adapt
+  setStatus('DARK ADAPT','trial');
+  currentPhase='adapt';
+  if(!await countdown(adaptSec,'DARK ADAPT','adapt')){endTrial();return;}
+  setPhase('adapt','done');
+
+  // Phase 2: Baseline
+  setStatus('BASELINE','trial');
+  currentPhase='baseline';
+  if(!await countdown(baseSec,'BASELINE','baseline')){endTrial();return;}
+  setPhase('baseline','done');
+
+  // Phase 3: Flash
+  setStatus('FLASH','trial');
+  currentPhase='flash';
+  setPhase('flash','active');
+  const flashStart=Date.now();
+
+  // Half-screen option reduces auto-exposure interference
+  const useHalf=$('halfScreenChk')?.checked||false;
+
+  if(colorSweep){
+    for(const [col,name] of[['#ff0000','RED'],['#00ff00','GREEN'],['#0000ff','BLUE'],['#ffffff','WHITE']]){
+      if(!S.trialRunning)break;
+      const {actual,preExposure}=await doFlash(col,flashMs,useHalf);
+      const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}μs`:'';
+      logEntry(`PLR:${name} ${actual}ms${expStr}`);
+      await delay(500);
+    }
+  }else{
+    const {actual,preExposure,postExposure}=await doFlash(gray,flashMs,useHalf);
+    const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}→${postExposure.exposureTime}μs`:'';
+    logEntry(`PLR:FLASH ${actual}ms${expStr}`);
+  }
+  setPhase('flash','done');
+
+  // Phase 4: Recovery
+  setStatus('RECOVERY','trial');
+  currentPhase='recovery';
+  if(!await countdown(recSec,'RECOVERY','recovery')){endTrial();return;}
+  setPhase('recovery','done');
+
+  try{
+    renderResults(flashStart);
+  }catch(e){
+    console.error('renderResults error:',e);
+    toast('Results error: '+e.message?.slice(0,40));
+  }
+  endTrial(); // always fires regardless of results error
+}
+
+function endTrial(){
+  S.trialRunning=false;currentPhase='';
+  hideCountdown();       // clears flashEl completely via cssText reset
+  setFlashRegion(true);
+  $('cam').classList.remove('trial');
+  $('trialBtn').disabled=false;$('colorBtn').disabled=false;
+  $('trialBtn').classList.remove('running');
+  $('trialBtn').textContent='▶ START PLR TRIAL';
+  setStatus('TRACKING','on');
+}
+
+// ── Results ───────────────────────────────────────────────────────────────
+function clf(v,lo,hi){
+  if(v==null)return'';
+  return(v>=lo&&v<=hi)?'ok':(v>=lo*.7&&v<=hi*1.3)?'w':'bad';
+}
+
+function renderResults(flashStart){
+  const good=p=>S.trialData.filter(d=>d.phase===p&&d.q!=='poor');
+  const avg=(arr,k)=>arr.length?arr.reduce((s,d)=>s+d[k],0)/arr.length:null;
+
+  const blL=avg(good('baseline'),'lPx'),blR=avg(good('baseline'),'rPx');
+  const post=[...good('flash'),...good('recovery')];
+  // Find the overall min first (for amplitude — can occur slightly later)
+  const absMinL=post.length?Math.min(...post.map(d=>d.lPx)):null;
+  const absMinR=post.length?Math.min(...post.map(d=>d.rPx)):null;
+  // Amplitude uses overall min (best constriction achieved, not just first 2s)
+  const minL=absMinL, minR=absMinR;
+  const ampL=blL&&minL?blL-minL:null, ampR=blR&&minR?blR-minR:null;
+  const pctL=ampL&&blL?(ampL/blL*100):null, pctR=ampR&&blR?(ampR/blR*100):null;
+  // Constrain latency search to 0–2000ms post-flash (real PLR is 200–500ms)
+  // Beyond 2s any minimum is slow drift, not constriction
+  const earlyPost=post.filter(d=>d.t_ms-flashStart<=2000&&d.t_ms-flashStart>=0);
+  const minPtL=earlyPost.length?earlyPost.reduce((a,b)=>b.lPx<a.lPx?b:a,{lPx:999,t_ms:0}):null;
+  const minPtR=earlyPost.length?earlyPost.reduce((a,b)=>b.rPx<a.rPx?b:a,{rPx:999,t_ms:0}):null;
+  const latL=minPtL&&minPtL.lPx<999?minPtL.t_ms-flashStart:null;
+  const latR=minPtR&&minPtR.rPx<999?minPtR.t_ms-flashStart:null;
+
+  // 75% redilation time
+  const redilTime=(side,blPx,minPx)=>{
+    if(!blPx||!minPx)return null;
+    const target=minPx+(blPx-minPx)*0.75;
+    const rec=good('recovery').filter(d=>d.t_ms>(minPtL?.t_ms||0));
+    const hit=rec.find(d=>d[side]>=target);
+    return hit?(hit.t_ms-(minPtL?.t_ms||flashStart))/1000:null;
+  };
+  const redilL=redilTime('lPx',blL,minL);
+  const redilR=redilTime('rPx',blR,minR);
+
+  S.lastResults={blL,blR,ampL,ampR,pctL,pctR,latL,latR,flashStart};
+
+  const f=(v,dp=1,u='')=>v!=null?v.toFixed(dp)+(u?` ${u}`:''):'—';
+  const rows=[
+    {n:'Baseline',lv:f(blL,1,'px'),rv:f(blR,1,'px'),norm:'varies',lc:'',rc:''},
+    {n:'Min post-flash',lv:f(minL,1,'px'),rv:f(minR,1,'px'),norm:'—',lc:'',rc:''},
+    {n:'Amplitude',lv:f(ampL,1,'px'),rv:f(ampR,1,'px'),norm:'>1 px',lc:clf(ampL,1,30),rc:clf(ampR,1,30)},
+    {n:'Constriction',lv:f(pctL,1,'%'),rv:f(pctR,1,'%'),norm:'5–20%',lc:clf(pctL,5,20),rc:clf(pctR,5,20)},
+    {n:'Latency',lv:latL?Math.round(latL)+'ms':'—',rv:latR?Math.round(latR)+'ms':'—',norm:'200–500ms',lc:clf(latL,200,500),rc:clf(latR,200,500)},
+    {n:'75% redilation',lv:f(redilL,1,'s'),rv:f(redilR,1,'s'),norm:'1–2s',lc:clf(redilL,1,2),rc:clf(redilR,1,2)},
+  ];
+
+  const tbody=$('resTbody');tbody.innerHTML='';
+  rows.forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${r.n}</td><td class="${r.lc}">${r.lv}</td><td class="${r.rc}">${r.rv}</td><td style="color:var(--dim);font-size:10px">${r.norm}</td>`;
+    tbody.appendChild(tr);
+  });
+  $('resSection').style.display='block';
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────
+function logEntry(label){
+  const list=$('loglist'),div=document.createElement('div');
+  div.className='lentry';
+  const l=S.smoothLpx?S.smoothLpx.toFixed(1):'—';
+  const r=S.smoothRpx?S.smoothRpx.toFixed(1):'—';
+  div.innerHTML=`<span class="lt">${new Date().toLocaleTimeString()}</span><span style="color:var(--dim);font-size:10px">${label} L${l}px R${r}px</span>`;
+  list.prepend(div);
+  if(list.children.length>30)list.removeChild(list.lastChild);
+}
+
+// ── Sliders ───────────────────────────────────────────────────────────────
+$('sAdapt').oninput=e=>$('vAdapt').textContent=e.target.value+'s';
+$('sBaseline').oninput=e=>$('vBaseline').textContent=e.target.value+'s';
+$('sFlash').oninput=e=>$('vFlash').textContent=e.target.value+'ms';
+$('sRecovery').oninput=e=>$('vRecovery').textContent=e.target.value+'s';
+$('sIntensity').oninput=e=>{
+  const Lstar=+e.target.value;
+  $('vIntensity').textContent=Lstar+'%';
+  // Show what this means in perceptual and sRGB terms
+  const hex=labLstarToSRGBhex(Lstar);
+  const srgbVal=+hex.match(/\d+/)[0];
+  $('lstarDisplay').textContent=Lstar;
+  $('srgbDisplay').textContent=srgbVal;
+};
+
+// ── Buttons ───────────────────────────────────────────────────────────────
+$('startBtn').onclick=async()=>{
+  const btn=$('startBtn');
+  btn.disabled=true;btn.textContent='Starting camera…';
+  // Step 1: camera first — triggers permission prompt immediately
+  try{
+    await startCamera();
+  }catch(e){
+    console.error('Camera:',e);
+    toast('Camera denied — check browser permissions');
+    btn.disabled=false;btn.textContent='Retry';
+    return;
+  }
+  $('splash').classList.add('gone');
+  btn.textContent='Loading model…';
+  $('lbar').classList.add('on');
+  setStatus('LOADING MODEL…','warn');
+  // Step 2: load model while camera already live
+  try{
+    await loadModel();
+  }catch(e){
+    console.error('Model:',e);
+    toast('Model error: '+(e?.message||'').slice(0,50));
+    $('lbar').classList.remove('on');
+    setStatus('ERROR','warn');
+    return;
+  }
+  $('lbar').classList.remove('on');
+  setStatus('TRACKING','on');
+  S.running=true;
+  ['stopBtn','snapBtn','trialBtn','colorBtn'].forEach(id=>$(id).disabled=false);
+  requestAnimationFrame(loop);
+};
+
+$('trialBtn').onclick=()=>runTrial(false);
+$('colorBtn').onclick=()=>runTrial(true);
+$('snapBtn').onclick=()=>logEntry('SNAP');
+
+$('stopBtn').onclick=()=>{
+  S.running=false;
+  if(S.trialRunning)endTrial();
+  hideCountdown();
+  video.srcObject?.getTracks().forEach(t=>t.stop());
+  $('splash').classList.remove('gone');
+  $('startBtn').disabled=false;$('startBtn').textContent='Restart';
+  ['stopBtn','snapBtn','trialBtn','colorBtn'].forEach(id=>$(id).disabled=true);
+  S.smoothLpx=S.smoothRpx=null;
+  setStatus('STOPPED');
+};
+
+$('exportBtn').onclick=()=>{
+  if(!S.trialData.length){toast('No trial data');return;}
+  const r=S.lastResults||{};
+  const adaptSec=+$('sAdapt').value,baseSec=+$('sBaseline').value;
+  const flashMs=+$('sFlash').value,recSec=+$('sRecovery').value;
+  const intv=+$('sIntensity').value;
+  const useHalf=$('halfScreenChk')?.checked||false;
+  const trialType=S.trialType||'PLR';
+
+  // Phase segment boundaries (cumulative seconds from trial start)
+  const adaptEnd=adaptSec*1000;
+  const baselineEnd=adaptEnd+baseSec*1000;
+  // flash is a single event; recovery follows
+  // We reconstruct from the phase label in data
+
+  const meta=[
+    '# PupilLens v3 PLR Export',
+    `# Date: ${new Date().toISOString()}`,
+    `# Trial type: ${trialType}`,
+    `# Trial start (unix ms): ${S.trialStartMs||'?'}`,
+    `# Segments — dark_adapt: 0–${adaptSec}s | baseline: ${adaptSec}–${adaptSec+baseSec}s | flash: ${flashMs}ms stimulus | recovery: ${adaptSec+baseSec}s+flash onward`,
+    `# Flash intensity: CIE L*=${intv} | half-screen: ${useHalf}`,
+    `# Camera settings: frameRate=${camSettings.frameRate||'?'}fps  exposureTime=${camSettings.exposureTime||'?'}μs  iso=${camSettings.iso||'?'}`,
+    `# Baseline L: ${r.blL?.toFixed(2)||'—'}px  R: ${r.blR?.toFixed(2)||'—'}px`,
+    `# Amplitude L: ${r.ampL?.toFixed(2)||'—'}px (${r.pctL?.toFixed(1)||'—'}%)  R: ${r.ampR?.toFixed(2)||'—'}px (${r.pctR?.toFixed(1)||'—'}%)`,
+    `# Latency L: ${r.latL?Math.round(r.latL)+'ms':'—'}  R: ${r.latR?Math.round(r.latR)+'ms':'—'}`,
+    `# CIELAB: intensity slider = L* value, converted via IEC 61966-2-1 sRGB gamma`,
+    `# Column notes:`,
+    `#   left/right_pupil_px_smooth : EMA-smoothed pupil radius in video pixels (main signal for waveform/PLR)`,
+    `#   left/right_pupil_px_raw    : per-frame raw pupil radius from pixel thresholding`,
+    `#   left/right_pupil_mm        : pupil diameter in mm (pupil_px_raw × 2 × mm/px scale)`,
+    `#   left/right_iris_radius_px  : iris outer boundary radius in px — used as mm/px ruler (11.7mm assumed)`,
+    `#   left/right_iris_mm         : iris diameter in mm (sanity check, should be ~11.7)`,
+    '#',
+    't_ms,elapsed_ms,segment,trial_type,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
+  ];
+
+  const rows=S.trialData.map(d=>[
+    d.t_ms,
+    d.elapsed_ms,
+    d.phase,
+    trialType,
+    intv,
+    flashMs,
+    adaptSec,
+    baseSec,
+    recSec,
+    d.lPx.toFixed(3),                        // smoothed pupil px
+    d.rPx.toFixed(3),
+    d.lPupilPx!=null?d.lPupilPx.toFixed(3):'', // raw pupil px
+    d.rPupilPx!=null?d.rPupilPx.toFixed(3):'',
+    d.lPupilMm?.toFixed(3)||'',              // pupil diameter mm
+    d.rPupilMm?.toFixed(3)||'',
+    d.lIrisRad?.toFixed(3)||'',              // iris radius px (ruler)
+    d.rIrisRad?.toFixed(3)||'',
+    d.lIrisMm?.toFixed(3)||'',              // iris diameter mm (~11.7)
+    d.rIrisMm?.toFixed(3)||'',
+    d.tilt.toFixed(3),
+    d.q,
+  ].join(','));
+
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([[...meta,...rows].join('\n')],{type:'text/csv'}));
+  a.download=`pupillens_v3_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
+  a.click();
+};
+
+$('clearBtn').onclick=()=>{
+  S.samples=[];S.hist.l=[];S.hist.r=[];S.trialData=[];S.lastResults=null;
+  S.smoothLpx=S.smoothRpx=S.baselineLpx=S.baselineRpx=null;
+  _prevL=_prevR=null;
+  ['Lpct','Rpct'].forEach(id=>$(id).textContent='—');
+  ['Ldelta','Rdelta'].forEach(id=>{$(id).textContent='Δ —';$(id).className='edelta flat';});
+  $('aval').textContent='—';$('afill').style.width='0%';
+  $('loglist').innerHTML='';$('resSection').style.display='none';
+  drawWave();
+};
+
+drawWave();
+
+// ── Service Worker registration ────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js')
+      .catch(err => console.warn('SW registration failed:', err));
+  });
+}
+</script>
+</body>
+</html>

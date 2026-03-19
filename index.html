@@ -1185,10 +1185,16 @@ $('exportBtn').onclick=()=>{
     d.q,
   ].join(','));
 
+  const csv=[...meta,...rows].join('\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
-  a.href=URL.createObjectURL(new Blob([[...meta,...rows].join('\n')],{type:'text/csv'}));
+  a.href=url;
   a.download=`pupillens_v3_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
+  document.body.appendChild(a);
   a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
 };
 
 $('clearBtn').onclick=()=>{

@@ -1,3 +1,4 @@
+
 // PupilLens v3 — Service Worker
 // Strategy:
 //   • App shell (index, manifest, icons) → cache-first, update in background

@@ -48,7 +48,7 @@ header{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 18px;
 
 /* Camera */
 #cam{position:relative;background:#000;overflow:hidden;transition:height .35s ease}
-#video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);transition:filter .3s}
 #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:3}
 
 /* Trial strip */
@@ -135,6 +135,10 @@ header{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 18px;
 .srow{display:flex;align-items:center;gap:8px;margin-bottom:7px}
 .slbl2{font-family:var(--mono);font-size:10px;color:var(--dim);width:86px;flex-shrink:0}
 input[type=range]{flex:1;accent-color:var(--accent);cursor:pointer}
+/* Hide number spinners cross-browser */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
 .sval{font-family:var(--mono);font-size:11px;color:var(--accent);width:44px;text-align:right}
 
 .btn-trial{width:100%;padding:11px;border:1px solid rgba(74,240,200,.3);border-radius:8px;background:rgba(74,240,200,.07);color:var(--accent);font-family:var(--mono);font-size:12px;letter-spacing:.5px;cursor:pointer;transition:all .2s;margin-bottom:6px}
@@ -230,6 +234,21 @@ table.res td.bad{color:var(--accent3)}
         R raw: <span class="rawval" id="rawR">—</span>px &nbsp;
         EAR: <span class="rawval" id="rawEAR">—</span>
       </div>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:1px;flex-shrink:0">IRIS SIZE</span>
+        <label style="display:flex;align-items:center;gap:4px;flex:1">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--accent2);width:12px">L</span>
+          <input type="number" id="irisL" value="11.7" min="8" max="14" step="0.1"
+            style="width:58px;background:var(--surf2);border:1px solid var(--border);border-radius:5px;padding:3px 6px;font-family:var(--mono);font-size:11px;color:var(--accent);text-align:center;-moz-appearance:textfield">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">mm</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;flex:1">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--accent3);width:12px">R</span>
+          <input type="number" id="irisR" value="11.7" min="8" max="14" step="0.1"
+            style="width:58px;background:var(--surf2);border:1px solid var(--border);border-radius:5px;padding:3px 6px;font-family:var(--mono);font-size:11px;color:var(--accent);text-align:center;-moz-appearance:textfield">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">mm</span>
+        </label>
+      </div>
     </div>
 
     <div class="sec">
@@ -245,9 +264,10 @@ table.res td.bad{color:var(--accent3)}
         <div class="pcard" id="ph-flash"><div class="picon">⚡</div><div class="pname">FLASH</div></div>
         <div class="pcard" id="ph-recovery"><div class="picon">🔄</div><div class="pname">RECOVERY</div></div>
       </div>
+      <div class="srow"><span class="slbl2">VIDEO DIM</span><input type="range" id="sDim" min="0" max="100" value="100" step="5"><span class="sval" id="vDim">100%</span></div>
       <div class="srow"><span class="slbl2">DARK ADAPT</span><input type="range" id="sAdapt" min="5" max="30" value="10" step="1"><span class="sval" id="vAdapt">10s</span></div>
       <div class="srow"><span class="slbl2">BASELINE</span><input type="range" id="sBaseline" min="2" max="10" value="5" step="1"><span class="sval" id="vBaseline">5s</span></div>
-      <div class="srow"><span class="slbl2">FLASH</span><input type="range" id="sFlash" min="50" max="2000" value="1000" step="50"><span class="sval" id="vFlash">2000ms</span></div>
+      <div class="srow"><span class="slbl2">FLASH</span><input type="range" id="sFlash" min="50" max="2000" value="1000" step="50"><span class="sval" id="vFlash">1000ms</span></div>
       <div class="srow"><span class="slbl2">RECOVERY</span><input type="range" id="sRecovery" min="5" max="30" value="15" step="1"><span class="sval" id="vRecovery">15s</span></div>
       <div class="srow">
         <span class="slbl2">INTENSITY</span>
@@ -265,7 +285,8 @@ table.res td.bad{color:var(--accent3)}
         </label>
       </div>
       <button class="btn-trial" id="trialBtn" disabled>▶ START PLR TRIAL</button>
-      <button class="btn-trial" id="colorBtn" disabled style="font-size:11px;padding:8px">🌈 COLOR SWEEP (R→G→B→W)</button>
+      <button class="btn-trial" id="colorBtn" disabled style="font-size:11px;padding:8px">🔴🔵 CHROMATIC PUPILLOMETRY (R→B)</button>
+      <button class="btn-trial" id="dampBtn" disabled style="font-size:11px;padding:8px">⚡ REFLEX DAMPING (5× white 250ms)</button>
     </div>
 
     <div class="sec" id="resSection" style="display:none">
@@ -351,6 +372,45 @@ function refreshCamSettings(){
   }catch(e){/* not available on all browsers */}
 }
 
+// ── AE Pseudo-Lock ────────────────────────────────────────────────────────
+// Attempts to freeze camera auto-exposure before a flash by applying the
+// current exposure/gain as fixed constraints. Falls back silently where
+// the ImageCapture / applyConstraints API is unsupported.
+// Returns a restore function that re-enables auto on call.
+async function aeLock(){
+  let restore=()=>{};
+  try{
+    const track=video.srcObject?.getVideoTracks()?.[0];
+    if(!track)return restore;
+    const caps=track.getCapabilities?.()??{};
+    const settings=track.getSettings();
+    const constraints={};
+    // Only lock what the browser actually supports
+    if(caps.exposureMode?.includes?.('manual')&&settings.exposureTime){
+      constraints.exposureMode='manual';
+      constraints.exposureTime=settings.exposureTime;
+    }
+    if(caps.whiteBalanceMode?.includes?.('manual')&&settings.colorTemperature){
+      constraints.whiteBalanceMode='manual';
+      constraints.colorTemperature=settings.colorTemperature;
+    }
+    if(Object.keys(constraints).length){
+      await track.applyConstraints({advanced:[constraints]});
+      restore=async()=>{
+        try{
+          const rel={};
+          if(constraints.exposureMode)rel.exposureMode='continuous';
+          if(constraints.whiteBalanceMode)rel.whiteBalanceMode='continuous';
+          await track.applyConstraints({advanced:[rel]});
+        }catch(e){/* ignore */}
+      };
+    }
+  }catch(e){
+    console.warn('AE lock not supported:',e.message);
+  }
+  return restore;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SECTION 4: Half-screen flash (prevents auto-exposure washout)
 // ───────────────────────────────────────────────────────────────────────────
@@ -375,9 +435,9 @@ function setFlashRegion(fullScreen){
 const S={
   running:false, detector:null, lastT:-1, frameCount:0,
   smoothLpx:null, smoothRpx:null,
-  baselineLpx:null, baselineRpx:null,   // set during baseline phase
+  baselineLpx:null, baselineRpx:null,
   hist:{l:[],r:[]}, samples:[], trialData:[],
-  lastResults:null, trialRunning:false,
+  lastResults:null, trialRunning:false, currentRep:null,
 };
 let currentPhase='';
 
@@ -527,8 +587,10 @@ function measure(kps){
   const lHorizPx=lRad*2, rHorizPx=rRad*2;
   const lDiamOk=lHorizPx>8&&lHorizPx<300;
   const rDiamOk=rHorizPx>8&&rHorizPx<300;
-  const lMmPerPx=lDiamOk?11.7/lHorizPx:null;
-  const rMmPerPx=rDiamOk?11.7/rHorizPx:null;
+  const irisMmL=parseFloat($('irisL')?.value)||11.7;
+  const irisMmR=parseFloat($('irisR')?.value)||11.7;
+  const lMmPerPx=lDiamOk?irisMmL/lHorizPx:null;
+  const rMmPerPx=rDiamOk?irisMmR/rHorizPx:null;
   // Seesaw detection: if L and R move in OPPOSITE directions by >2px it's pose drift
   // We detect this in updateUI() using per-frame delta comparison
   const quality=tiltR<1.4?'good':tiltR<1.7?'fair':'poor';
@@ -761,6 +823,7 @@ function updateUI(m){
       t_ms:now,
       elapsed_ms:S.trialStartMs?now-S.trialStartMs:0,
       phase:currentPhase,
+      rep:S.currentRep??'',
       trial_type:S.trialType||'PLR',
       lPx:L,rPx:R,                          // smoothed pupil px (real signal)
       lPupilPx:m.lPupilPx,rPupilPx:m.rPupilPx, // raw per-frame pupil px
@@ -847,9 +910,10 @@ async function doFlash(color,ms,halfScreen=false){
   await repaint();
   await delay(100);
 
-  // 2. Snapshot camera exposure BEFORE flash
+  // 2. Snapshot camera exposure BEFORE flash + attempt AE lock
   refreshCamSettings();
   const preExposure={...camSettings};
+  const aeRestore=await aeLock();
 
   // 3. Stimulus on — instant colour change, await repaint before starting clock
   flashSet(color,1);
@@ -861,6 +925,9 @@ async function doFlash(color,ms,halfScreen=false){
   // 4. Snapshot exposure AFTER flash (will show if camera auto-adjusted)
   refreshCamSettings();
   const postExposure={...camSettings};
+
+  // Restore auto-exposure after capture
+  await aeRestore();
 
   // Log if exposure changed during flash (potential artifact)
   if(preExposure.exposureTime&&postExposure.exposureTime){
@@ -911,20 +978,18 @@ async function runTrial(colorSweep=false){
   if(S.trialRunning||!S.running)return;
   S.trialRunning=true;S.trialData=[];currentPhase='';
   S.trialStartMs=Date.now();
-  S.trialType=colorSweep?'COLOR_SWEEP':'PLR';
-  S.baselineLpx=null;S.baselineRpx=null;
+  S.trialType=colorSweep?'CHROMATIC':'PLR';
+  S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
   // Reset EMA smoothing so trial starts from clean state
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
-  $('trialBtn').disabled=true;$('colorBtn').disabled=true;
+  $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
   $('trialBtn').classList.add('running');
   $('cam').classList.add('trial');
 
   const adaptSec=+$('sAdapt').value,baseSec=+$('sBaseline').value;
   const flashMs=+$('sFlash').value,recSec=+$('sRecovery').value;
   const intv=+$('sIntensity').value;
-  // Convert slider (0-100) → CIE L* (0-100) → linear luminance → sRGB
-  // This ensures perceived brightness matches the slider value accurately
   const gray=labLstarToSRGBhex(intv);
 
   // Phase 1: Dark adapt
@@ -945,28 +1010,34 @@ async function runTrial(colorSweep=false){
   setPhase('flash','active');
   const flashStart=Date.now();
 
-  // Half-screen option reduces auto-exposure interference
   const useHalf=$('halfScreenChk')?.checked||false;
 
   if(colorSweep){
-    for(const [col,name] of[['#ff0000','RED'],['#00ff00','GREEN'],['#0000ff','BLUE'],['#ffffff','WHITE']]){
-      if(!S.trialRunning)break;
-      const {actual,preExposure}=await doFlash(col,flashMs,useHalf);
-      const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}μs`:'';
-      logEntry(`PLR:${name} ${actual}ms${expStr}`);
-      await delay(500);
-    }
+    // ── Chromatic Pupillometry: 1000ms Red → 45s recovery → 1000ms Blue → 45s recovery
+    $('sPhase').textContent='RED FLASH';
+    const r1=await doFlash('#ff0000',1000,useHalf);
+    logEntry(`CHROMATIC:RED ${r1.actual}ms`);
+    currentPhase='recovery';
+    $('sPhase').textContent='RED RECOVERY';
+    if(!await countdown(45,'RED RECOVERY','recovery')){endTrial();return;}
+
+    currentPhase='flash';
+    $('sPhase').textContent='BLUE FLASH';
+    const r2=await doFlash('#0000ff',1000,useHalf);
+    logEntry(`CHROMATIC:BLUE ${r2.actual}ms`);
+    currentPhase='recovery';
+    $('sPhase').textContent='BLUE RECOVERY';
+    if(!await countdown(45,'BLUE RECOVERY','recovery')){endTrial();return;}
   }else{
     const {actual,preExposure,postExposure}=await doFlash(gray,flashMs,useHalf);
     const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}→${postExposure.exposureTime}μs`:'';
     logEntry(`PLR:FLASH ${actual}ms${expStr}`);
+    setPhase('flash','done');
+    // Phase 4: Recovery
+    setStatus('RECOVERY','trial');
+    currentPhase='recovery';
+    if(!await countdown(recSec,'RECOVERY','recovery')){endTrial();return;}
   }
-  setPhase('flash','done');
-
-  // Phase 4: Recovery
-  setStatus('RECOVERY','trial');
-  currentPhase='recovery';
-  if(!await countdown(recSec,'RECOVERY','recovery')){endTrial();return;}
   setPhase('recovery','done');
 
   try{
@@ -975,7 +1046,81 @@ async function runTrial(colorSweep=false){
     console.error('renderResults error:',e);
     toast('Results error: '+e.message?.slice(0,40));
   }
-  endTrial(); // always fires regardless of results error
+  endTrial();
+}
+
+// ── Reflex Damping Trial ──────────────────────────────────────────────────
+// 5× [250ms white flash → 2000ms recovery], then 30s final recovery
+async function runDampingTrial(){
+  if(S.trialRunning||!S.running)return;
+  S.trialRunning=true;S.trialData=[];currentPhase='';
+  S.trialStartMs=Date.now();
+  S.trialType='REFLEX_DAMPING';
+  S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
+  S.smoothLpx=null;S.smoothRpx=null;
+  _prevL=null;_prevR=null;
+  $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
+  $('dampBtn').classList.add('running');
+  $('cam').classList.add('trial');
+
+  const adaptSec=+$('sAdapt').value,baseSec=+$('sBaseline').value;
+  const useHalf=$('halfScreenChk')?.checked||false;
+
+  setStatus('DARK ADAPT','trial');
+  currentPhase='adapt';
+  if(!await countdown(adaptSec,'DARK ADAPT','adapt')){endDampingTrial();return;}
+  setPhase('adapt','done');
+
+  setStatus('BASELINE','trial');
+  currentPhase='baseline';
+  if(!await countdown(baseSec,'BASELINE','baseline')){endDampingTrial();return;}
+  setPhase('baseline','done');
+
+  const flashStart=Date.now();
+  setPhase('flash','active');
+
+  const REPS=5;
+  for(let rep=1;rep<=REPS;rep++){
+    if(!S.trialRunning)break;
+    currentPhase='flash';
+    S.currentRep=rep;   // tag frames with rep number
+    setStatus(`FLASH ${rep}/${REPS}`,'trial');
+    $('sPhase').textContent=`FLASH ${rep}/${REPS}`;
+    const {actual}=await doFlash('#ffffff',250,useHalf);
+    logEntry(`DAMPING:FLASH${rep} ${actual}ms`);
+    if(!S.trialRunning)break;
+    currentPhase='recovery';
+    S.currentRep=rep;
+    $('sPhase').textContent=`RECOVERY ${rep}/${REPS}`;
+    await delay(2000);  // 2000ms inter-flash recovery (no countdown)
+  }
+  S.currentRep=null;
+
+  // 30s final recovery
+  setPhase('flash','done');
+  setStatus('FINAL RECOVERY','trial');
+  currentPhase='recovery';
+  $('sPhase').textContent='FINAL RECOVERY';
+  if(!await countdown(30,'FINAL RECOVERY','recovery')){endDampingTrial();return;}
+  setPhase('recovery','done');
+
+  try{
+    renderResults(flashStart);
+  }catch(e){
+    console.error('renderResults error:',e);
+  }
+  endDampingTrial();
+}
+
+function endDampingTrial(){
+  S.trialRunning=false;currentPhase='';
+  hideCountdown();
+  setFlashRegion(true);
+  $('cam').classList.remove('trial');
+  $('trialBtn').disabled=false;$('colorBtn').disabled=false;$('dampBtn').disabled=false;
+  $('dampBtn').classList.remove('running');
+  $('dampBtn').textContent='⚡ REFLEX DAMPING (5× white 250ms)';
+  setStatus('TRACKING','on');
 }
 
 function endTrial(){
@@ -983,7 +1128,7 @@ function endTrial(){
   hideCountdown();       // clears flashEl completely via cssText reset
   setFlashRegion(true);
   $('cam').classList.remove('trial');
-  $('trialBtn').disabled=false;$('colorBtn').disabled=false;
+  $('trialBtn').disabled=false;$('colorBtn').disabled=false;$('dampBtn').disabled=false;
   $('trialBtn').classList.remove('running');
   $('trialBtn').textContent='▶ START PLR TRIAL';
   setStatus('TRACKING','on');
@@ -1064,6 +1209,11 @@ $('sAdapt').oninput=e=>$('vAdapt').textContent=e.target.value+'s';
 $('sBaseline').oninput=e=>$('vBaseline').textContent=e.target.value+'s';
 $('sFlash').oninput=e=>$('vFlash').textContent=e.target.value+'ms';
 $('sRecovery').oninput=e=>$('vRecovery').textContent=e.target.value+'s';
+$('sDim').oninput=e=>{
+  const pct=+e.target.value;
+  $('vDim').textContent=pct+'%';
+  $('video').style.filter=pct<100?`brightness(${(pct/100).toFixed(2)})`:'';
+};
 $('sIntensity').oninput=e=>{
   const Lstar=+e.target.value;
   $('vIntensity').textContent=Lstar+'%';
@@ -1104,22 +1254,35 @@ $('startBtn').onclick=async()=>{
   $('lbar').classList.remove('on');
   setStatus('TRACKING','on');
   S.running=true;
-  ['stopBtn','snapBtn','trialBtn','colorBtn'].forEach(id=>$(id).disabled=false);
+  ['stopBtn','snapBtn','trialBtn','colorBtn','dampBtn'].forEach(id=>$(id).disabled=false);
   requestAnimationFrame(loop);
 };
 
 $('trialBtn').onclick=()=>runTrial(false);
 $('colorBtn').onclick=()=>runTrial(true);
+$('dampBtn').onclick=()=>runDampingTrial();
 $('snapBtn').onclick=()=>logEntry('SNAP');
 
 $('stopBtn').onclick=()=>{
   S.running=false;
-  if(S.trialRunning)endTrial();
-  hideCountdown();
+  if(S.trialRunning){
+    // endTrial covers PLR/chromatic; endDampingTrial covers damping
+    // Both check S.trialRunning so just reset the flag and call both safely
+    S.trialRunning=false;
+    hideCountdown();
+    setFlashRegion(true);
+    $('cam').classList.remove('trial');
+    ['trialBtn','colorBtn','dampBtn'].forEach(id=>{
+      $(id).disabled=true;
+      $(id).classList.remove('running');
+    });
+    $('trialBtn').textContent='▶ START PLR TRIAL';
+    $('dampBtn').textContent='⚡ REFLEX DAMPING (5× white 250ms)';
+  }
   video.srcObject?.getTracks().forEach(t=>t.stop());
   $('splash').classList.remove('gone');
   $('startBtn').disabled=false;$('startBtn').textContent='Restart';
-  ['stopBtn','snapBtn','trialBtn','colorBtn'].forEach(id=>$(id).disabled=true);
+  ['stopBtn','snapBtn','trialBtn','colorBtn','dampBtn'].forEach(id=>$(id).disabled=true);
   S.smoothLpx=S.smoothRpx=null;
   setStatus('STOPPED');
 };
@@ -1140,12 +1303,20 @@ $('exportBtn').onclick=()=>{
   // We reconstruct from the phase label in data
 
   const meta=[
-    '# PupilLens v3 PLR Export',
+    '# PupilLens v3 Export',
     `# Date: ${new Date().toISOString()}`,
     `# Trial type: ${trialType}`,
     `# Trial start (unix ms): ${S.trialStartMs||'?'}`,
-    `# Segments — dark_adapt: 0–${adaptSec}s | baseline: ${adaptSec}–${adaptSec+baseSec}s | flash: ${flashMs}ms stimulus | recovery: ${adaptSec+baseSec}s+flash onward`,
-    `# Flash intensity: CIE L*=${intv} | half-screen: ${useHalf}`,
+    trialType==='REFLEX_DAMPING'
+      ? `# Segments — dark_adapt: 0–${adaptSec}s | baseline: ${adaptSec}–${adaptSec+baseSec}s | 5× [flash:250ms + recovery:2000ms] | final_recovery:30s`
+      : trialType==='CHROMATIC'
+        ? `# Segments — dark_adapt: 0–${adaptSec}s | baseline: ${adaptSec}–${adaptSec+baseSec}s | red_flash:1000ms | red_recovery:45s | blue_flash:1000ms | blue_recovery:45s`
+        : `# Segments — dark_adapt: 0–${adaptSec}s | baseline: ${adaptSec}–${adaptSec+baseSec}s | flash: ${flashMs}ms stimulus | recovery: ${adaptSec+baseSec}s+flash onward`,
+    trialType==='REFLEX_DAMPING'
+      ? `# Flash: 5× 250ms white, 2000ms inter-flash ISI, 30s final recovery | half-screen: ${useHalf}`
+      : trialType==='CHROMATIC'
+        ? `# Flash: 1000ms pure red (#ff0000) then 1000ms pure blue (#0000ff) | half-screen: ${useHalf}`
+        : `# Flash intensity: CIE L*=${intv} | half-screen: ${useHalf}`,
     `# Camera settings: frameRate=${camSettings.frameRate||'?'}fps  exposureTime=${camSettings.exposureTime||'?'}μs  iso=${camSettings.iso||'?'}`,
     `# Baseline L: ${r.blL?.toFixed(2)||'—'}px  R: ${r.blR?.toFixed(2)||'—'}px`,
     `# Amplitude L: ${r.ampL?.toFixed(2)||'—'}px (${r.pctL?.toFixed(1)||'—'}%)  R: ${r.ampR?.toFixed(2)||'—'}px (${r.pctR?.toFixed(1)||'—'}%)`,
@@ -1155,16 +1326,17 @@ $('exportBtn').onclick=()=>{
     `#   left/right_pupil_px_smooth : EMA-smoothed pupil radius in video pixels (main signal for waveform/PLR)`,
     `#   left/right_pupil_px_raw    : per-frame raw pupil radius from pixel thresholding`,
     `#   left/right_pupil_mm        : pupil diameter in mm (pupil_px_raw × 2 × mm/px scale)`,
-    `#   left/right_iris_radius_px  : iris outer boundary radius in px — used as mm/px ruler (11.7mm assumed)`,
-    `#   left/right_iris_mm         : iris diameter in mm (sanity check, should be ~11.7)`,
+    `#   left/right_iris_radius_px  : iris outer boundary radius in px — used as mm/px ruler`,
+    `#   left/right_iris_mm         : iris diameter in mm (sanity check — L=${parseFloat($('irisL')?.value)||11.7}mm, R=${parseFloat($('irisR')?.value)||11.7}mm assumed)`,
     '#',
-    't_ms,elapsed_ms,segment,trial_type,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
+    't_ms,elapsed_ms,segment,rep,trial_type,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
   ];
 
   const rows=S.trialData.map(d=>[
     d.t_ms,
     d.elapsed_ms,
     d.phase,
+    d.rep??'',
     trialType,
     intv,
     flashMs,
@@ -1200,6 +1372,7 @@ $('exportBtn').onclick=()=>{
 $('clearBtn').onclick=()=>{
   S.samples=[];S.hist.l=[];S.hist.r=[];S.trialData=[];S.lastResults=null;
   S.smoothLpx=S.smoothRpx=S.baselineLpx=S.baselineRpx=null;
+  S.currentRep=null;
   _prevL=_prevR=null;
   ['Lpct','Rpct'].forEach(id=>$(id).textContent='—');
   ['Ldelta','Rdelta'].forEach(id=>{$(id).textContent='Δ —';$(id).className='edelta flat';});

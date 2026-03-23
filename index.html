@@ -479,13 +479,52 @@ async function loadModel(){
   );
 }
 
-// ── Iris radius: mean distance from center to 4 edge landmarks ──────────────
-// Simpler and more robust than Kasa algebraic fit.
-// Iris landmarks: center=ci, edges=es,es+1,es+2,es+3
-function irisRadius(kps, ci, es){
-  let s=0;
-  for(let i=es;i<es+4;i++) s+=Math.hypot(kps[i].x-kps[ci].x, kps[i].y-kps[ci].y);
-  return s/4;
+// ── Iris measurement: HVID-primary with ratio-gated vertical fallback ────────
+// Horizontal edge pair (ci+1 → ci+3) is most robust — immune to eyelid
+// occlusion. Vertical (ci+2, ci+4) only used when both poles pass ratio gate.
+//
+// Confirmed MediaPipe iris landmark layout (refineLandmarks:true):
+//   ci+0 = center
+//   ci+1 = right edge  ← horizontal, always reliable
+//   ci+2 = top edge    ← vertical, often occluded by upper lid
+//   ci+3 = left edge   ← horizontal, always reliable
+//   ci+4 = bottom edge ← vertical, sometimes occluded by lower lid
+//
+// Right iris: center=468, edges 469–472
+// Left  iris: center=473, edges 474–477
+// Eyelid landmarks: R upper=159 lower=145 / L upper=386 lower=374
+
+const IRIS_RATIO_GATE = 0.85; // edge point must be ≥85% of horiz radius from center
+const IRIS_EYELID_BUF = 6;    // px — iris top/bottom must clear eyelid by this margin
+
+function measureIrisDiam(kps, ci, upperLidIdx, lowerLidIdx){
+  const cx=kps[ci].x,    cy=kps[ci].y;
+  const er=kps[ci+1].x,  ery=kps[ci+1].y; // right edge (horizontal)
+  const et=kps[ci+2].x,  ety=kps[ci+2].y; // top edge   (vertical)
+  const el=kps[ci+3].x,  ely=kps[ci+3].y; // left edge  (horizontal)
+  const eb=kps[ci+4].x,  eby=kps[ci+4].y; // bottom edge(vertical)
+
+  // Primary: horizontal HVID — always use, never occluded by lids
+  const horizDiam = Math.hypot(er-el, ery-ely);
+  const horizRad  = horizDiam / 2;
+
+  // Individual radii
+  const rTop = Math.hypot(et-cx, ety-cy);
+  const rBot = Math.hypot(eb-cx, eby-cy);
+
+  // Eyelid + ratio gate for vertical poles
+  const upperY = kps[upperLidIdx].y;
+  const lowerY = kps[lowerLidIdx].y;
+  const topOk  = ety < upperY - IRIS_EYELID_BUF && rTop >= horizRad * IRIS_RATIO_GATE;
+  const botOk  = eby > lowerY + IRIS_EYELID_BUF && rBot >= horizRad * IRIS_RATIO_GATE;
+
+  // Vertical diameter — only when both poles clearly unoccluded
+  const vertDiam = (topOk && botOk) ? Math.hypot(et-eb, ety-eby) : null;
+
+  // Weighted blend: horiz dominant (weight 3), vert added if available (weight 1)
+  const diam = vertDiam !== null ? (horizDiam * 3 + vertDiam) / 4 : horizDiam;
+
+  return { diam, horizDiam, vertDiam, horizRad, topOk, botOk };
 }
 
 // ── Pupil measurement: threshold dark region inside iris circle ───────────
@@ -574,25 +613,27 @@ function measure(kps){
   const rEAR=earOf(kps,159,145,133,33);
   const lOpen=lEAR>0.15, rOpen=rEAR>0.15;
 
-  // Iris radius: mean distance from center landmark to 4 edge landmarks
-  // L iris: 468=center, 469=top, 470=right, 471=bottom, 472=left
-  // R iris: 473=center, 474=top, 475=right, 476=bottom, 477=left
-  const lRad=irisRadius(kps,468,469);
-  const rRad=irisRadius(kps,473,474);
+  // ── Iris measurement: HVID-primary ───────────────────────────────────────
+  // subject LEFT  iris: center=468, eyelids upper=386 lower=374
+  // subject RIGHT iris: center=473, eyelids upper=159 lower=145
+  const lIris = measureIrisDiam(kps, 468, 386, 374);
+  const rIris = measureIrisDiam(kps, 473, 159, 145);
 
-  // Tilt ratio + mm scale: mean radius from center to 4 edge landmarks
-  // lRad and _lMeanR are the same calculation — reuse lRad directly
-  const tiltR=(lRad>0&&rRad>0)?Math.max(lRad,rRad)/Math.min(lRad,rRad):1;
-  // Diameter for mm calibration (iris = 11.7mm population average)
-  const lHorizPx=lRad*2, rHorizPx=rRad*2;
-  const lDiamOk=lHorizPx>8&&lHorizPx<300;
-  const rDiamOk=rHorizPx>8&&rHorizPx<300;
-  const irisMmL=parseFloat($('irisL')?.value)||11.7;
-  const irisMmR=parseFloat($('irisR')?.value)||11.7;
-  const lMmPerPx=lDiamOk?irisMmL/lHorizPx:null;
-  const rMmPerPx=rDiamOk?irisMmR/rHorizPx:null;
-  // Seesaw detection: if L and R move in OPPOSITE directions by >2px it's pose drift
-  // We detect this in updateUI() using per-frame delta comparison
+  // lRad/rRad kept for backward compat with pupil measurement + tilt ratio
+  const lRad = lIris.diam / 2;
+  const rRad = rIris.diam / 2;
+
+  const tiltR = (lRad>0&&rRad>0) ? Math.max(lRad,rRad)/Math.min(lRad,rRad) : 1;
+
+  // mm/px scale derived from HVID — most stable, matches clinical WTW definition
+  const lHorizPx = lIris.horizDiam;
+  const rHorizPx = rIris.horizDiam;
+  const lDiamOk  = lHorizPx > 8 && lHorizPx < 300;
+  const rDiamOk  = rHorizPx > 8 && rHorizPx < 300;
+  const irisMmL  = parseFloat($('irisL')?.value) || 11.7;
+  const irisMmR  = parseFloat($('irisR')?.value) || 11.7;
+  const lMmPerPx = lDiamOk ? irisMmL / lHorizPx : null;
+  const rMmPerPx = rDiamOk ? irisMmR / rHorizPx : null;
   const quality=tiltR<1.4?'good':tiltR<1.7?'fair':'poor';
   const valid=lOpen&&rOpen&&lRad>3&&rRad>3&&tiltR<2.0;
 
@@ -600,22 +641,25 @@ function measure(kps){
   const lPupilPx = measurePupil(video, kps[468].x, kps[468].y, lRad);
   const rPupilPx = measurePupil(video, kps[473].x, kps[473].y, rRad);
 
-  const lIrisMm  = lMmPerPx ? lRad*2*lMmPerPx : null;   // should ≈ 11.7mm
-  const rIrisMm  = rMmPerPx ? rRad*2*rMmPerPx : null;
+  const lIrisMm  = lMmPerPx ? lHorizPx * lMmPerPx : null;  // = irisMmL (sanity check)
+  const rIrisMm  = rMmPerPx ? rHorizPx * rMmPerPx : null;  // = irisMmR
   // Pupil mm: measured radius in px × mm/px scale × 2 for diameter
   const lPupilMm = (lPupilPx!=null&&lMmPerPx) ? lPupilPx*2*lMmPerPx : null;
   const rPupilMm = (rPupilPx!=null&&rMmPerPx) ? rPupilPx*2*rMmPerPx : null;
 
   return{
-    lRad,rRad,
-    lPupilPx,rPupilPx,
-    lHorizPx,rHorizPx,lDiamOk,rDiamOk,
+    lRad, rRad,
+    lPupilPx, rPupilPx,
+    lHorizPx, rHorizPx, lDiamOk, rDiamOk,
+    lVertDiam: lIris.vertDiam, rVertDiam: rIris.vertDiam,
+    lTopOk: lIris.topOk, lBotOk: lIris.botOk,
+    rTopOk: rIris.topOk, rBotOk: rIris.botOk,
     lCx:kps[468].x, lCy:kps[468].y,
     rCx:kps[473].x, rCy:kps[473].y,
-    lEAR,rEAR,lOpen,rOpen,
-    quality,tiltR,valid,
-    lPupilMm,rPupilMm,lIrisMm,rIrisMm,
-    lMmPerPx,rMmPerPx,
+    lEAR, rEAR, lOpen, rOpen,
+    quality, tiltR, valid,
+    lPupilMm, rPupilMm, lIrisMm, rIrisMm,
+    lMmPerPx, rMmPerPx,
   };
 }
 

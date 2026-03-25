@@ -301,6 +301,13 @@ table.res td.bad{color:var(--accent3)}
           <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">Flash right half only (reduces auto-exposure shift)</span>
         </label>
       </div>
+      <div class="srow" style="margin-bottom:10px">
+        <span class="slbl2">VALIDATION</span>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;flex:1">
+          <input type="checkbox" id="valChk" style="accent-color:var(--warn);width:16px;height:16px">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">Save eye frames ±50–300ms at flash on/off</span>
+        </label>
+      </div>
       <button class="btn-trial" id="trialBtn" disabled>▶ START PLR TRIAL</button>
       <button class="btn-trial" id="colorBtn" disabled style="font-size:11px;padding:8px">🔴🔵 CHROMATIC PUPILLOMETRY (R→B)</button>
       <button class="btn-trial" id="dampBtn" disabled style="font-size:11px;padding:8px">⚡ REFLEX DAMPING (5× white 250ms)</button>
@@ -325,6 +332,7 @@ table.res td.bad{color:var(--accent3)}
     <div class="sec">
       <div class="btnrow">
         <button class="bsm" id="exportBtn">↓ Trial CSV</button>
+        <button class="bsm" id="exportValBtn" style="display:none">↓ Val Frames</button>
         <button class="bsm red" id="clearBtn">✕ Clear</button>
         <button class="bsm red" id="stopBtn" disabled>■ Stop</button>
       </div>
@@ -456,6 +464,9 @@ const S={
   hist:{l:[],r:[]}, samples:[], trialData:[],
   lastResults:null, trialRunning:false, currentRep:null,
   plrFlashColor:null, currentFlashColor:null,
+  valFrames:[],          // [{label, t_ms, elapsed_ms, window, dataURL}, ...]
+  flashOnTime:null,      // wall-clock ms when flash stimulus turned on
+  flashOffTime:null,     // wall-clock ms when flash stimulus turned off
 };
 let currentPhase='';
 
@@ -798,6 +809,153 @@ function drawWave(){
   wctx.fillStyle='#ff6b9d';wctx.fillText('R',15*PR,11*PR);
 }
 
+// ── Validation frame capture ──────────────────────────────────────────────
+// Captures a 2-row composite for each eye: RGB crop (top) + threshold mask (bottom).
+// Called every frame during trial when validation mode is on and we're within
+// the ±50–300 ms windows around flash-on or flash-off.
+const _valCanvas = document.createElement('canvas');
+const _valCtx    = _valCanvas.getContext('2d', {willReadFrequently: true});
+
+function captureValidationFrame(m, elapsed_ms){
+  if(!$('valChk')?.checked) return;
+  if(!S.trialRunning) return;
+
+  const now = Date.now();
+  const windows = [];
+  if(S.flashOnTime){
+    const dt = now - S.flashOnTime;
+    if(dt >= -50 && dt <= 300) windows.push({label:'ON', dt});
+  }
+  if(S.flashOffTime){
+    const dt = now - S.flashOffTime;
+    if(dt >= -50 && dt <= 300) windows.push({label:'OFF', dt});
+  }
+  if(!windows.length) return;
+
+  // For each eye, crop the iris region from the live video, then build threshold mask
+  const eyes = [
+    {tag:'L', cx:m.lCx, cy:m.lCy, irisRad:m.lRad, pupilPx:m.lPupilPx},
+    {tag:'R', cx:m.rCx, cy:m.rCy, irisRad:m.rRad, pupilPx:m.rPupilPx},
+  ];
+
+  const CELL = 120;          // each crop scaled to this square
+  const ROWS  = 2;           // row 0: RGB, row 1: threshold
+  const COLS  = eyes.length; // 2 eyes side by side
+  const PAD   = 18;          // label bar height
+  const W     = CELL * COLS;
+  const H     = CELL * ROWS + PAD;
+
+  _valCanvas.width  = W;
+  _valCanvas.height = H;
+  _valCtx.fillStyle = '#050508';
+  _valCtx.fillRect(0, 0, W, H);
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+
+  eyes.forEach((eye, col) => {
+    const {cx, cy, irisRad} = eye;
+    if(!vw || irisRad < 4) return;
+
+    const size = Math.round(irisRad * 2) * 2;
+    const half = size / 2;
+    const srcX = Math.round(cx - half);
+    const srcY = Math.round(cy - half);
+    if(srcX < 0 || srcY < 0 || srcX + size > vw || srcY + size > vh) return;
+
+    // ── Row 0: RGB crop ──────────────────────────────────────────────────
+    _valCtx.drawImage(video, srcX, srcY, size, size,
+                      col * CELL, PAD, CELL, CELL);
+
+    // Draw iris circle outline on RGB row
+    _valCtx.beginPath();
+    _valCtx.arc(col * CELL + CELL/2, PAD + CELL/2, CELL/2 - 1, 0, Math.PI*2);
+    _valCtx.strokeStyle = col===0 ? 'rgba(123,143,255,.6)' : 'rgba(255,107,157,.6)';
+    _valCtx.lineWidth = 1;
+    _valCtx.stroke();
+
+    // ── Row 1: threshold mask ────────────────────────────────────────────
+    // Re-use the existing _pupilCanvas crop (already drawn for this eye by measurePupil)
+    // We need to rebuild it here since we don't cache it. Use a temp canvas.
+    const tmp = document.createElement('canvas');
+    tmp.width = size; tmp.height = size;
+    const tc  = tmp.getContext('2d', {willReadFrequently: true});
+    tc.drawImage(video, srcX, srcY, size, size, 0, 0, size, size);
+    const imgd = tc.getImageData(0, 0, size, size);
+    const pxd  = imgd.data;
+
+    // Grayscale + threshold inside iris circle
+    const cx2 = half, cy2 = half, r2 = irisRad * irisRad;
+    let sum = 0, cnt = 0;
+    const gray = new Float32Array(size * size);
+    for(let y = 0; y < size; y++){
+      for(let x = 0; x < size; x++){
+        const dx = x - cx2, dy = y - cy2;
+        if(dx*dx + dy*dy > r2) continue;
+        const i = (y * size + x) * 4;
+        const g = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
+        gray[y * size + x] = g;
+        sum += g; cnt++;
+      }
+    }
+    const mean = cnt > 0 ? sum / cnt : 128;
+    const thresh = mean * 0.55;
+
+    // Write mask pixels
+    const maskd = tc.createImageData(size, size);
+    const md    = maskd.data;
+    for(let y = 0; y < size; y++){
+      for(let x = 0; x < size; x++){
+        const dx = x - cx2, dy = y - cy2;
+        const inside = dx*dx + dy*dy <= r2;
+        const i = (y * size + x) * 4;
+        if(!inside){
+          // Outside iris: dark gray
+          md[i]=20; md[i+1]=20; md[i+2]=30; md[i+3]=255;
+        } else if(gray[y*size+x] <= thresh){
+          // Pupil (dark): bright green
+          md[i]=80; md[i+1]=255; md[i+2]=180; md[i+3]=255;
+        } else {
+          // Iris: mid blue-gray
+          const v = Math.round(gray[y*size+x]);
+          md[i]=v>>1; md[i+1]=v>>1; md[i+2]=v; md[i+3]=255;
+        }
+      }
+    }
+    tc.putImageData(maskd, 0, 0);
+    _valCtx.drawImage(tmp, 0, 0, size, size,
+                      col * CELL, PAD + CELL, CELL, CELL);
+
+    // Iris circle on mask row
+    _valCtx.beginPath();
+    _valCtx.arc(col * CELL + CELL/2, PAD + CELL + CELL/2, CELL/2 - 1, 0, Math.PI*2);
+    _valCtx.strokeStyle = 'rgba(255,255,255,.3)';
+    _valCtx.lineWidth = 1;
+    _valCtx.stroke();
+
+    // Eye label
+    _valCtx.fillStyle = col===0 ? '#7b8fff' : '#ff6b9d';
+    _valCtx.font = '9px Space Mono,monospace';
+    _valCtx.fillText(eye.tag, col * CELL + 3, PAD - 4);
+  });
+
+  // Top label bar
+  windows.forEach(w => {
+    const sign = w.dt >= 0 ? '+' : '';
+    const label = `FLASH ${w.label}  ${sign}${w.dt}ms  t=${elapsed_ms}ms  ph:${currentPhase}`;
+    _valCtx.fillStyle = w.label==='ON' ? 'rgba(255,183,71,.9)' : 'rgba(74,240,200,.9)';
+    _valCtx.font = 'bold 9px Space Mono,monospace';
+    _valCtx.fillText(label, 2, 11);
+
+    S.valFrames.push({
+      label,
+      window: w.label,
+      dt: w.dt,
+      elapsed_ms,
+      dataURL: _valCanvas.toDataURL('image/png'),
+    });
+  });
+}
+
 // ── UI update (only called for valid frames) ──────────────────────────────
 let _prevL=null, _prevR=null;
 function updateUI(m){
@@ -895,6 +1053,8 @@ function updateUI(m){
       tilt:m.tiltR,q:m.quality,
       flashColor:S.currentFlashColor||'',
     });
+    // Validation frame capture (flash-window eye images)
+    captureValidationFrame(m, S.trialStartMs ? now - S.trialStartMs : 0);
     // Accumulate baseline
     if(currentPhase==='baseline'){
       const bl=S.trialData.filter(d=>d.phase==='baseline');
@@ -982,6 +1142,7 @@ async function doFlash(color,ms,halfScreen=false){
   flashSet(color,1);
   await repaint();
   const t0=performance.now();
+  S.flashOnTime=Date.now();   // wall-clock flash ON
   await delay(ms);
   const actual=Math.round(performance.now()-t0);
 
@@ -1004,7 +1165,77 @@ async function doFlash(color,ms,halfScreen=false){
   // 5. Instant cut to black
   flashSet('#000',0);
   await repaint();
+  S.flashOffTime=Date.now();  // wall-clock flash OFF
   setFlashRegion(true); // restore full screen
+
+  return{actual,preExposure,postExposure};
+}
+
+// ── Blue flicker flash: white↔blue 150ms square wave for full duration ────
+// Provides high photonic power (white half-cycles) while delivering the blue
+// melanopsin stimulus (blue half-cycles). Starts on blue, alternates every 150ms.
+async function doFlashBlueFlicker(ms, halfScreen=false){
+  setFlashRegion(!halfScreen);
+
+  // GPU pre-warm both colors
+  const warm=document.createElement('canvas');
+  warm.width=2;warm.height=2;
+  const wctx2=warm.getContext('2d');
+  wctx2.fillStyle='#0000ff';wctx2.fillRect(0,0,2,2);
+  wctx2.fillStyle='#ffffff';wctx2.fillRect(0,0,1,2);
+
+  // 1. Black pre-frame
+  flashSet('#000',1);
+  await repaint();
+  await delay(100);
+
+  // 2. Snapshot + AE lock before stimulus
+  refreshCamSettings();
+  const preExposure={...camSettings};
+  const aeRestore=await aeLock();
+
+  // 3. Flicker loop — 150ms blue / 150ms white, for total duration ms
+  const PERIOD=150;
+  const t0=performance.now();
+  S.flashOnTime=Date.now();
+
+  let phase=0; // 0=blue, 1=white
+  flashSet('#0000ff',1);
+  await repaint();
+
+  while(true){
+    const elapsed=performance.now()-t0;
+    if(elapsed>=ms) break;
+    // How long until next toggle?
+    const cyclePos=elapsed % PERIOD;
+    const remaining=Math.min(PERIOD-cyclePos, ms-elapsed);
+    await delay(remaining);
+    phase^=1;
+    flashSet(phase?'#ffffff':'#0000ff',1);
+    // No repaint await in the tight loop — just set and move on for minimum latency
+  }
+
+  const actual=Math.round(performance.now()-t0);
+
+  // 4. Snapshot exposure after stimulus
+  refreshCamSettings();
+  const postExposure={...camSettings};
+  await aeRestore();
+
+  // Log exposure shift if any
+  if(preExposure.exposureTime&&postExposure.exposureTime){
+    const ratio=postExposure.exposureTime/preExposure.exposureTime;
+    if(ratio<0.7||ratio>1.4){
+      console.warn(`⚠ Camera exposure changed during blue flicker: ${preExposure.exposureTime}→${postExposure.exposureTime}μs (×${ratio.toFixed(2)})`);
+      logEntry(`⚠ CAM EXPOSURE SHIFT ×${ratio.toFixed(2)}`);
+    }
+  }
+
+  // 5. Cut to black
+  flashSet('#000',0);
+  await repaint();
+  S.flashOffTime=Date.now();
+  setFlashRegion(true);
 
   return{actual,preExposure,postExposure};
 }
@@ -1044,6 +1275,7 @@ async function runTrial(colorSweep=false){
   S.trialType=colorSweep?'CHROMATIC':'PLR';
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
   S.currentFlashColor=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
   // Reset EMA smoothing so trial starts from clean state
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
@@ -1099,16 +1331,20 @@ async function runTrial(colorSweep=false){
     currentPhase='flash';
     S.currentFlashColor='blue';
     $('sPhase').textContent='BLUE FLASH';
-    const r2=await doFlash('#0000ff',1000,useHalf);
-    logEntry(`CHROMATIC:BLUE ${r2.actual}ms`);
+    const r2=await doFlashBlueFlicker(1000,useHalf);
+    logEntry(`CHROMATIC:BLUE(flicker) ${r2.actual}ms`);
     currentPhase='recovery';
     $('sPhase').textContent='BLUE RECOVERY';
     if(!await countdown(45,'BLUE RECOVERY','recovery')){endTrial();return;}
   }else{
     S.currentFlashColor=plrColorLabel;
-    const {actual,preExposure,postExposure}=await doFlash(plrFlashColor,flashMs,useHalf);
+    const flashFn = plrColorLabel==='blue'
+      ? ()=>doFlashBlueFlicker(flashMs,useHalf)
+      : ()=>doFlash(plrFlashColor,flashMs,useHalf);
+    const {actual,preExposure,postExposure}=await flashFn();
     const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}→${postExposure.exposureTime}μs`:'';
-    logEntry(`PLR:FLASH ${plrColorLabel.toUpperCase()} ${actual}ms${expStr}`);
+    const flickerTag=plrColorLabel==='blue'?'(flicker)':'';
+    logEntry(`PLR:FLASH ${plrColorLabel.toUpperCase()}${flickerTag} ${actual}ms${expStr}`);
     setPhase('flash','done');
     // Phase 4: Recovery
     setStatus('RECOVERY','trial');
@@ -1136,6 +1372,7 @@ async function runDampingTrial(){
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
   $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
   $('dampBtn').classList.add('running');
   $('cam').classList.add('trial');
@@ -1301,6 +1538,66 @@ $('sIntensity').oninput=e=>{
   $('srgbDisplay').textContent=srgbVal;
 };
 
+// Show/hide Val Frames export button whenever the checkbox changes
+$('valChk').onchange=e=>{
+  $('exportValBtn').style.display=e.target.checked?'':'none';
+};
+
+$('exportValBtn').onclick=()=>{
+  if(!S.valFrames.length){toast('No validation frames captured yet');return;}
+
+  // Pack all frames into a single contact-sheet PNG
+  // Layout: one column, frames stacked vertically, with a text label strip above each
+  const first = S.valFrames[0];
+  // Extract dimensions from the first dataURL by drawing it to a temp canvas
+  const imgEl = new Image();
+  imgEl.onload = ()=>{
+    const fw = imgEl.naturalWidth;   // frame width
+    const fh = imgEl.naturalHeight;  // frame height
+    const LBLH = 14;                 // label row above each frame
+    const N = S.valFrames.length;
+
+    const sheet = document.createElement('canvas');
+    sheet.width  = fw;
+    sheet.height = (fh + LBLH) * N;
+    const sc = sheet.getContext('2d');
+    sc.fillStyle = '#050508';
+    sc.fillRect(0, 0, sheet.width, sheet.height);
+
+    // Load all frame images, then draw them in order
+    let loaded = 0;
+    S.valFrames.forEach((f, i) => {
+      const img = new Image();
+      img.onload = ()=>{
+        const y = i * (fh + LBLH);
+        // Label strip
+        sc.fillStyle = f.window==='ON' ? 'rgba(255,183,71,.9)' : 'rgba(74,240,200,.85)';
+        sc.fillRect(0, y, fw, LBLH);
+        sc.fillStyle = '#050508';
+        sc.font = 'bold 9px Space Mono,monospace';
+        sc.fillText(`#${i+1}  ${f.label}`, 3, y + LBLH - 3);
+        // Frame image
+        sc.drawImage(img, 0, y + LBLH);
+        loaded++;
+        if(loaded === N){
+          // All drawn — download
+          sheet.toBlob(blob=>{
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `pupillens_val_${new Date().toISOString().slice(0,16).replace('T','_')}.png`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            setTimeout(()=>URL.revokeObjectURL(url), 10000);
+            toast(`Saved ${N} validation frames`);
+          }, 'image/png');
+        }
+      };
+      img.src = f.dataURL;
+    });
+  };
+  imgEl.src = first.dataURL;
+};
+
 // ── Buttons ───────────────────────────────────────────────────────────────
 $('startBtn').onclick=async()=>{
   const btn=$('startBtn');
@@ -1453,6 +1750,7 @@ $('clearBtn').onclick=()=>{
   S.samples=[];S.hist.l=[];S.hist.r=[];S.trialData=[];S.lastResults=null;
   S.smoothLpx=S.smoothRpx=S.baselineLpx=S.baselineRpx=null;
   S.currentRep=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
   _prevL=_prevR=null;
   ['Lpct','Rpct'].forEach(id=>$(id).textContent='—');
   ['Ldelta','Rdelta'].forEach(id=>{$(id).textContent='Δ —';$(id).className='edelta flat';});

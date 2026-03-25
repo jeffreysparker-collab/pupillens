@@ -1,4 +1,4 @@
-// PupilLens v3 — Service Worker
+// PupilLens v4 — Service Worker
 // Strategy:
 //   • App shell (index, manifest, icons) → cache-first, update in background
 //   • CDN scripts (MediaPipe, TF.js) → cache-first (they are pinned versions)

@@ -10,7 +10,7 @@
 <link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="manifest" href="manifest.json">
-<title>PupilLens v3</title>
+<title>PupilLens v4</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -173,7 +173,7 @@ table.res td.bad{color:var(--accent3)}
 <div id="app">
   <header>
     <div class="logo">Pupil<span>Lens</span></div>
-    <span class="v3badge">v3</span>
+    <span class="v3badge">v4</span>
     <div style="font-family:var(--mono);font-size:11px;color:var(--dim)">PLR Protocol</div>
     <div class="pill"><div class="dot" id="dot"></div><span id="stxt">IDLE</span></div>
   </header>
@@ -191,7 +191,7 @@ table.res td.bad{color:var(--accent3)}
 
     <div id="splash">
       <div class="eye-icon">👁</div>
-      <h2>PupilLens v3</h2>
+      <h2>PupilLens v4</h2>
       <p>Iris tracking + PLR protocol. Tracks % change in pupil size — the real signal.</p>
       <button class="btn-start" id="startBtn">Start Camera</button>
       <div class="hint">· Dim room for best results<br>· 35–50 cm from screen<br>· Look straight at camera</div>
@@ -556,73 +556,152 @@ function measureIrisDiam(kps, ci, upperLidIdx, lowerLidIdx){
   return { diam, horizDiam, vertDiam, horizRad, topOk, botOk };
 }
 
-// ── Pupil measurement: threshold dark region inside iris circle ───────────
-// Crops a square region around the iris center from the live video frame,
-// converts to grayscale, then finds the largest contiguous dark region
-// (the pupil) by adaptive thresholding within the iris boundary.
-// Returns pupil radius in video-pixel units, or null if unreliable.
+// ── Pupil measurement v4 ─────────────────────────────────────────────────
+// Pipeline:
+//   1. Crop iris region from video frame
+//   2. Grayscale (Rec.709)
+//   3. Annular working zone:
+//        r < innerRad (1 mm)  → forced dark  (anatomical pupil floor)
+//        r > outerRad (4 mm)  → excluded     (only iris/limbus beyond here)
+//        ring between the two → goes to blur + Otsu
+//   4. 3×3 box blur on ring pixels only — kills single-pixel noise/speckle
+//   5. Otsu threshold on the ring histogram → finds iris/pupil boundary
+//   6. Full dark mask = inner disk ∪ ring pixels below Otsu threshold
+//   7. Second-order central moments → best-fit circle radius
+//        r = 2·sqrt((σx²+σy²)/2)  more robust than sqrt(area/π) for
+//        partially occluded or asymmetric pupils
+//   8. Centroid gate: blob centroid must be within 25% of irisRad from center
+//   9. Hard clamp: return radius only if result is in [1 mm, 4 mm] equivalent
+//
+// Iris diameter assumed ~11.7 mm → mmPerPx = irisMm / irisHorizPx
+// Inner 1 mm radius  = irisRad × (1   / 5.85) ≈ irisRad × 0.171
+// Outer 4 mm radius  = irisRad × (4   / 5.85) ≈ irisRad × 0.683
+// These constants are derived from irisMm=11.7, so irisRad = 5.85 mm equivalent.
+
 const _pupilCanvas=document.createElement('canvas');
 const _pupilCtx=_pupilCanvas.getContext('2d',{willReadFrequently:true});
 
 function measurePupil(vid, cx, cy, irisRad){
   if(!vid||!vid.videoWidth||irisRad<4)return null;
-  // Crop a square 2× the iris diameter, clamped to video bounds
+
   const vw=vid.videoWidth, vh=vid.videoHeight;
-  const size=Math.round(irisRad*2)*2;   // even number for symmetry
+  const size=Math.round(irisRad*2)*2;  // even, covers full iris diameter
   const half=size/2;
-  // srcX/srcY: top-left corner of crop in video pixel space
   const srcX=Math.round(cx-half), srcY=Math.round(cy-half);
-  // Bail if iris is too close to the edge to get a clean crop
   if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh)return null;
 
   _pupilCanvas.width=size;
   _pupilCanvas.height=size;
-  // Draw only the cropped iris region — no full-frame copy
   _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
-
   const {data}=_pupilCtx.getImageData(0,0,size,size);
-  // Convert to grayscale and collect intensities within the iris circle
-  const pixels=new Uint8Array(size*size);
-  let sum=0, count=0;
-  const cx2=half, cy2=half, r2=irisRad*irisRad;
+
+  // ── Anatomical radius limits in pixel units ──────────────────────────────
+  // iris radius ≈ 5.85 mm → scale factor = irisRad / 5.85
+  const mmToPx  = irisRad / 5.85;
+  const innerR  = 1.0 * mmToPx;   // 1 mm  — pupil floor, always dark
+  const outerR  = 4.0 * mmToPx;   // 4 mm  — max pupil radius, clamp beyond
+  const innerR2 = innerR * innerR;
+  const outerR2 = outerR * outerR;
+  const cx2=half, cy2=half;
+
+  // ── Pass 1: grayscale + zone classification ──────────────────────────────
+  // zone: 0=outside, 1=inner disk (forced dark), 2=ring (threshold zone)
+  const gray = new Float32Array(size*size);
+  const zone = new Uint8Array(size*size);   // 0/1/2
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
       const dx=x-cx2, dy=y-cy2;
-      if(dx*dx+dy*dy>r2)continue;   // outside iris circle
+      const r2=dx*dx+dy*dy;
+      if(r2>outerR2) continue;             // outside working zone
       const i=(y*size+x)*4;
-      // Rec.709 luminance weights
       const g=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
-      pixels[y*size+x]=g;
-      sum+=g; count++;
+      gray[y*size+x]=g;
+      zone[y*size+x]= r2<=innerR2 ? 1 : 2; // 1=inner forced-dark, 2=ring
     }
   }
-  if(count<16)return null;
-  const mean=sum/count;
-  // Adaptive threshold: pupil is pixels darker than 55% of mean iris luminance.
-  // This is robust to overall brightness changes (flash, room light shifts).
-  const thresh=mean*0.55;
 
-  // Count dark pixels and compute their centroid to find pupil radius
-  // Use circular moment: sqrt(dark_area / π) as radius estimate
-  let darkCount=0, darkSumX=0, darkSumY=0;
+  // ── Pass 2: 3×3 box blur on ring pixels only ────────────────────────────
+  const blurred = new Float32Array(size*size);
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
-      const dx=x-cx2, dy=y-cy2;
-      if(dx*dx+dy*dy>r2)continue;
-      if(pixels[y*size+x]<=thresh){
-        darkCount++;
-        darkSumX+=x; darkSumY+=y;
+      if(zone[y*size+x]!==2) continue;
+      let s=0, n=0;
+      for(let dy=-1;dy<=1;dy++){
+        for(let dx=-1;dx<=1;dx++){
+          const ny=y+dy, nx=x+dx;
+          if(ny<0||ny>=size||nx<0||nx>=size) continue;
+          const z=zone[ny*size+nx];
+          if(z===0) continue;              // don't pull in outside pixels
+          // inner disk contributes 0 luminance (it IS the dark pupil seed)
+          s += z===1 ? 0 : gray[ny*size+nx];
+          n++;
+        }
       }
+      blurred[y*size+x] = n>0 ? s/n : gray[y*size+x];
     }
   }
-  if(darkCount<4)return null;
 
-  // Radius from area: r = sqrt(A/π)
-  const pupilRad=Math.sqrt(darkCount/Math.PI);
+  // ── Pass 3: Otsu threshold on ring histogram ────────────────────────────
+  // Build 256-bin histogram from ring pixels (after blur)
+  const hist=new Int32Array(256);
+  let ringCount=0;
+  for(let i=0;i<size*size;i++){
+    if(zone[i]!==2) continue;
+    hist[Math.min(255,Math.round(blurred[i]))]++;
+    ringCount++;
+  }
+  if(ringCount<16) return null;
 
-  // Sanity bounds: pupil must be 10–80% of iris radius
-  if(pupilRad<irisRad*0.10||pupilRad>irisRad*0.85)return null;
-  return pupilRad;  // in video pixel units
+  // Otsu: maximise between-class variance
+  let sumAll=0;
+  for(let t=0;t<256;t++) sumAll+=t*hist[t];
+  let sumB=0, wB=0, bestVar=0, otsuT=0;
+  for(let t=0;t<256;t++){
+    wB+=hist[t]; if(!wB) continue;
+    const wF=ringCount-wB; if(!wF) break;
+    sumB+=t*hist[t];
+    const mB=sumB/wB, mF=(sumAll-sumB)/wF;
+    const v=wB*wF*(mB-mF)*(mB-mF);
+    if(v>bestVar){bestVar=v;otsuT=t;}
+  }
+
+  // ── Pass 4: build dark mask ─────────────────────────────────────────────
+  // inner disk = always dark; ring pixels at or below Otsu threshold = dark
+  let m00=0, m10=0, m01=0, m20=0, m02=0;
+  for(let y=0;y<size;y++){
+    for(let x=0;x<size;x++){
+      const idx=y*size+x;
+      const z=zone[idx];
+      if(z===0) continue;
+      const dark = z===1 || blurred[idx]<=otsuT;
+      if(!dark) continue;
+      // accumulate moments
+      m00++;
+      m10+=x; m01+=y;
+      m20+=x*x; m02+=y*y;
+    }
+  }
+  if(m00<4) return null;
+
+  // ── Pass 5: centroid gate ────────────────────────────────────────────────
+  const centX=m10/m00, centY=m01/m00;
+  const centDx=centX-cx2, centDy=centY-cy2;
+  const centDist=Math.sqrt(centDx*centDx+centDy*centDy);
+  if(centDist > irisRad*0.25) return null;  // blob not centred on pupil axis
+
+  // ── Pass 6: second-order central moments → best-fit circle radius ────────
+  // μ20 = m20/m00 - cx², μ02 = m02/m00 - cy²
+  // σ² = (μ20 + μ02) / 2   →  radius of equivalent circle = 2·sqrt(σ²)
+  const mu20 = m20/m00 - centX*centX;
+  const mu02 = m02/m00 - centY*centY;
+  const sigma2 = (mu20+mu02)/2;
+  if(sigma2<=0) return null;
+  const pupilRad = 2*Math.sqrt(sigma2);
+
+  // ── Hard clamp: must be within anatomical bounds ─────────────────────────
+  if(pupilRad < innerR || pupilRad > outerR) return null;
+
+  return pupilRad;  // video pixel units, radius
 }
 
 // ── Eye Aspect Ratio (blink detection) ───────────────────────────────────
@@ -873,9 +952,8 @@ function captureValidationFrame(m, elapsed_ms){
     _valCtx.lineWidth = 1;
     _valCtx.stroke();
 
-    // ── Row 1: threshold mask ────────────────────────────────────────────
-    // Re-use the existing _pupilCanvas crop (already drawn for this eye by measurePupil)
-    // We need to rebuild it here since we don't cache it. Use a temp canvas.
+    // ── Row 1: v4 threshold mask ─────────────────────────────────────────
+    // Mirrors the measurePupil v4 pipeline exactly so validation is honest.
     const tmp = document.createElement('canvas');
     tmp.width = size; tmp.height = size;
     const tc  = tmp.getContext('2d', {willReadFrequently: true});
@@ -883,45 +961,98 @@ function captureValidationFrame(m, elapsed_ms){
     const imgd = tc.getImageData(0, 0, size, size);
     const pxd  = imgd.data;
 
-    // Grayscale + threshold inside iris circle
-    const cx2 = half, cy2 = half, r2 = irisRad * irisRad;
-    let sum = 0, cnt = 0;
+    const cx2 = half, cy2 = half;
+    const mmToPx  = irisRad / 5.85;
+    const innerR  = 1.0 * mmToPx, innerR2 = innerR * innerR;
+    const outerR  = 4.0 * mmToPx, outerR2 = outerR * outerR;
+
+    // Grayscale + zone classification
     const gray = new Float32Array(size * size);
+    const zoneV = new Uint8Array(size * size);
     for(let y = 0; y < size; y++){
       for(let x = 0; x < size; x++){
-        const dx = x - cx2, dy = y - cy2;
-        if(dx*dx + dy*dy > r2) continue;
+        const dx = x - cx2, dy = y - cy2, r2 = dx*dx + dy*dy;
+        if(r2 > outerR2) continue;
         const i = (y * size + x) * 4;
-        const g = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
-        gray[y * size + x] = g;
-        sum += g; cnt++;
+        gray[y*size+x] = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
+        zoneV[y*size+x] = r2 <= innerR2 ? 1 : 2;
       }
     }
-    const mean = cnt > 0 ? sum / cnt : 128;
-    const thresh = mean * 0.55;
 
-    // Write mask pixels
-    const maskd = tc.createImageData(size, size);
-    const md    = maskd.data;
+    // 3×3 box blur on ring
+    const blurred = new Float32Array(size * size);
     for(let y = 0; y < size; y++){
       for(let x = 0; x < size; x++){
-        const dx = x - cx2, dy = y - cy2;
-        const inside = dx*dx + dy*dy <= r2;
-        const i = (y * size + x) * 4;
-        if(!inside){
-          // Outside iris: dark gray
-          md[i]=20; md[i+1]=20; md[i+2]=30; md[i+3]=255;
-        } else if(gray[y*size+x] <= thresh){
-          // Pupil (dark): bright green
+        if(zoneV[y*size+x] !== 2) continue;
+        let s = 0, n = 0;
+        for(let dy = -1; dy <= 1; dy++){
+          for(let dx = -1; dx <= 1; dx++){
+            const ny = y+dy, nx = x+dx;
+            if(ny<0||ny>=size||nx<0||nx>=size) continue;
+            const z = zoneV[ny*size+nx];
+            if(z===0) continue;
+            s += z===1 ? 0 : gray[ny*size+nx]; n++;
+          }
+        }
+        blurred[y*size+x] = n > 0 ? s/n : gray[y*size+x];
+      }
+    }
+
+    // Otsu on ring
+    const hist = new Int32Array(256); let ringCnt = 0;
+    for(let i = 0; i < size*size; i++){
+      if(zoneV[i] !== 2) continue;
+      hist[Math.min(255, Math.round(blurred[i]))]++; ringCnt++;
+    }
+    let sumAll = 0;
+    for(let t = 0; t < 256; t++) sumAll += t * hist[t];
+    let sumB = 0, wB = 0, bestVar = 0, otsuT = 0;
+    for(let t = 0; t < 256; t++){
+      wB += hist[t]; if(!wB) continue;
+      const wF = ringCnt - wB; if(!wF) break;
+      sumB += t * hist[t];
+      const mB = sumB/wB, mF = (sumAll-sumB)/wF;
+      const v = wB * wF * (mB-mF) * (mB-mF);
+      if(v > bestVar){ bestVar = v; otsuT = t; }
+    }
+
+    // Write mask pixels with zone colour coding:
+    //   bright green  = pupil (dark, classified)
+    //   yellow        = inner disk (forced dark, 1mm floor)
+    //   blue-gray     = iris ring (above threshold)
+    //   dark          = outside working zone
+    // Also draw the inner and outer radius circles
+    const maskd = tc.createImageData(size, size);
+    const md = maskd.data;
+    for(let y = 0; y < size; y++){
+      for(let x = 0; x < size; x++){
+        const idx = y*size+x;
+        const i = idx * 4;
+        const z = zoneV[idx];
+        if(z === 0){
+          md[i]=15; md[i+1]=15; md[i+2]=22; md[i+3]=255;
+        } else if(z === 1){
+          // inner disk: yellow — always-dark seed
+          md[i]=255; md[i+1]=220; md[i+2]=40; md[i+3]=255;
+        } else if(blurred[idx] <= otsuT){
+          // ring pupil: bright green
           md[i]=80; md[i+1]=255; md[i+2]=180; md[i+3]=255;
         } else {
-          // Iris: mid blue-gray
-          const v = Math.round(gray[y*size+x]);
+          // iris: blue-gray
+          const v = Math.round(blurred[idx]);
           md[i]=v>>1; md[i+1]=v>>1; md[i+2]=v; md[i+3]=255;
         }
+        md[i+3]=255;
       }
     }
     tc.putImageData(maskd, 0, 0);
+
+    // Draw inner (yellow) and outer (white) radius rings on mask
+    tc.beginPath(); tc.arc(cx2,cy2,innerR,0,Math.PI*2);
+    tc.strokeStyle='rgba(255,220,40,.7)'; tc.lineWidth=1; tc.stroke();
+    tc.beginPath(); tc.arc(cx2,cy2,outerR,0,Math.PI*2);
+    tc.strokeStyle='rgba(255,255,255,.35)'; tc.lineWidth=1; tc.stroke();
+
     _valCtx.drawImage(tmp, 0, 0, size, size,
                       col * CELL, PAD + CELL, CELL, CELL);
 
@@ -1677,7 +1808,7 @@ $('exportBtn').onclick=()=>{
   // We reconstruct from the phase label in data
 
   const meta=[
-    '# PupilLens v3 Export',
+    '# PupilLens v4 Export',
     `# Date: ${new Date().toISOString()}`,
     `# Trial type: ${trialType}`,
     `# Trial start (unix ms): ${S.trialStartMs||'?'}`,

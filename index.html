@@ -267,8 +267,8 @@ table.res td.bad{color:var(--accent3)}
       <div class="srow"><span class="slbl2">VIDEO DIM</span><input type="range" id="sDim" min="0" max="100" value="100" step="5"><span class="sval" id="vDim">100%</span></div>
       <div class="srow"><span class="slbl2">DARK ADAPT</span><input type="range" id="sAdapt" min="5" max="30" value="10" step="1"><span class="sval" id="vAdapt">10s</span></div>
       <div class="srow"><span class="slbl2">BASELINE</span><input type="range" id="sBaseline" min="2" max="10" value="5" step="1"><span class="sval" id="vBaseline">5s</span></div>
-      <div class="srow"><span class="slbl2">FLASH</span><input type="range" id="sFlash" min="50" max="2000" value="1000" step="50"><span class="sval" id="vFlash">1000ms</span></div>
-      <div class="srow"><span class="slbl2">RECOVERY</span><input type="range" id="sRecovery" min="5" max="30" value="15" step="1"><span class="sval" id="vRecovery">15s</span></div>
+      <div class="srow"><span class="slbl2">FLASH</span><input type="range" id="sFlash" min="1000" max="20000" value="1000" step="1000"><span class="sval" id="vFlash">1000ms</span></div>
+      <div class="srow"><span class="slbl2">RECOVERY</span><input type="range" id="sRecovery" min="10" max="60" value="15" step="5"><span class="sval" id="vRecovery">15s</span></div>
       <div class="srow">
         <span class="slbl2">INTENSITY</span>
         <input type="range" id="sIntensity" min="1" max="100" value="100">
@@ -276,6 +276,23 @@ table.res td.bad{color:var(--accent3)}
       </div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--dim);margin:-4px 0 8px;padding-left:94px">
         CIE L* = <span id="lstarDisplay" style="color:var(--accent)">100</span> → sRGB <span id="srgbDisplay" style="color:var(--accent)">255</span>
+      </div>
+      <div class="srow" style="margin-bottom:10px">
+        <span class="slbl2">FLASH COLOR</span>
+        <div style="display:flex;gap:6px;flex:1">
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--dim)">
+            <input type="radio" name="plrColor" id="colorWhite" value="white" checked style="accent-color:var(--accent)">
+            <span style="color:#e8eaf6">⬜ White</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--dim)">
+            <input type="radio" name="plrColor" id="colorRed" value="red" style="accent-color:var(--accent3)">
+            <span style="color:#ff6b9d">🔴 Red</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--dim)">
+            <input type="radio" name="plrColor" id="colorBlue" value="blue" style="accent-color:var(--accent2)">
+            <span style="color:#7b8fff">🔵 Blue</span>
+          </label>
+        </div>
       </div>
       <div class="srow" style="margin-bottom:10px">
         <span class="slbl2">HALF SCREEN</span>
@@ -438,6 +455,7 @@ const S={
   baselineLpx:null, baselineRpx:null,
   hist:{l:[],r:[]}, samples:[], trialData:[],
   lastResults:null, trialRunning:false, currentRep:null,
+  plrFlashColor:null, currentFlashColor:null,
 };
 let currentPhase='';
 
@@ -875,6 +893,7 @@ function updateUI(m){
       lPupilMm:m.lPupilMm,rPupilMm:m.rPupilMm,
       lIrisMm:m.lIrisMm,rIrisMm:m.rIrisMm,
       tilt:m.tiltR,q:m.quality,
+      flashColor:S.currentFlashColor||'',
     });
     // Accumulate baseline
     if(currentPhase==='baseline'){
@@ -1024,6 +1043,7 @@ async function runTrial(colorSweep=false){
   S.trialStartMs=Date.now();
   S.trialType=colorSweep?'CHROMATIC':'PLR';
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
+  S.currentFlashColor=null;
   // Reset EMA smoothing so trial starts from clean state
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
@@ -1035,6 +1055,16 @@ async function runTrial(colorSweep=false){
   const flashMs=+$('sFlash').value,recSec=+$('sRecovery').value;
   const intv=+$('sIntensity').value;
   const gray=labLstarToSRGBhex(intv);
+
+  // Determine flash color for PLR trial
+  const selectedColor=document.querySelector('input[name="plrColor"]:checked')?.value||'white';
+  const plrFlashColor = selectedColor==='red' ? '#ff0000'
+                      : selectedColor==='blue' ? '#0000ff'
+                      : gray;
+  const plrColorLabel = selectedColor==='red' ? 'red'
+                      : selectedColor==='blue' ? 'blue'
+                      : 'white';
+  S.plrFlashColor = plrColorLabel;
 
   // Phase 1: Dark adapt
   setStatus('DARK ADAPT','trial');
@@ -1058,6 +1088,7 @@ async function runTrial(colorSweep=false){
 
   if(colorSweep){
     // ── Chromatic Pupillometry: 1000ms Red → 45s recovery → 1000ms Blue → 45s recovery
+    S.currentFlashColor='red';
     $('sPhase').textContent='RED FLASH';
     const r1=await doFlash('#ff0000',1000,useHalf);
     logEntry(`CHROMATIC:RED ${r1.actual}ms`);
@@ -1066,6 +1097,7 @@ async function runTrial(colorSweep=false){
     if(!await countdown(45,'RED RECOVERY','recovery')){endTrial();return;}
 
     currentPhase='flash';
+    S.currentFlashColor='blue';
     $('sPhase').textContent='BLUE FLASH';
     const r2=await doFlash('#0000ff',1000,useHalf);
     logEntry(`CHROMATIC:BLUE ${r2.actual}ms`);
@@ -1073,9 +1105,10 @@ async function runTrial(colorSweep=false){
     $('sPhase').textContent='BLUE RECOVERY';
     if(!await countdown(45,'BLUE RECOVERY','recovery')){endTrial();return;}
   }else{
-    const {actual,preExposure,postExposure}=await doFlash(gray,flashMs,useHalf);
+    S.currentFlashColor=plrColorLabel;
+    const {actual,preExposure,postExposure}=await doFlash(plrFlashColor,flashMs,useHalf);
     const expStr=preExposure.exposureTime?` exp:${preExposure.exposureTime}→${postExposure.exposureTime}μs`:'';
-    logEntry(`PLR:FLASH ${actual}ms${expStr}`);
+    logEntry(`PLR:FLASH ${plrColorLabel.toUpperCase()} ${actual}ms${expStr}`);
     setPhase('flash','done');
     // Phase 4: Recovery
     setStatus('RECOVERY','trial');
@@ -1373,7 +1406,7 @@ $('exportBtn').onclick=()=>{
     `#   left/right_iris_radius_px  : iris outer boundary radius in px — used as mm/px ruler`,
     `#   left/right_iris_mm         : iris diameter in mm (sanity check — L=${parseFloat($('irisL')?.value)||11.7}mm, R=${parseFloat($('irisR')?.value)||11.7}mm assumed)`,
     '#',
-    't_ms,elapsed_ms,segment,rep,trial_type,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
+    't_ms,elapsed_ms,segment,rep,trial_type,flash_color,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
   ];
 
   const rows=S.trialData.map(d=>[
@@ -1382,6 +1415,9 @@ $('exportBtn').onclick=()=>{
     d.phase,
     d.rep??'',
     trialType,
+    trialType==='PLR' ? (S.plrFlashColor||'white')
+      : trialType==='CHROMATIC' ? (d.flashColor||'')
+      : 'white',
     intv,
     flashMs,
     adaptSec,

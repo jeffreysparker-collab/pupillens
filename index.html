@@ -491,7 +491,7 @@ async function startCamera(){
   });
   video.srcObject=stream;
   return new Promise((res,rej)=>{
-    video.onloadedmetadata=()=>{video.play();res();};
+    video.onloadedmetadata=()=>{video.play().then(res).catch(rej);};
     video.onerror=rej;
   });
 }

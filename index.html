@@ -467,6 +467,7 @@ const S={
   valFrames:[],          // [{label, t_ms, elapsed_ms, window, dataURL}, ...]
   flashOnTime:null,      // wall-clock ms when flash stimulus turned on
   flashOffTime:null,     // wall-clock ms when flash stimulus turned off
+  lastValFrameTime:null, // throttle timestamp for validation cadence
 };
 let currentPhase='';
 
@@ -561,31 +562,30 @@ function measureIrisDiam(kps, ci, upperLidIdx, lowerLidIdx){
 //   1. Crop iris region from video frame
 //   2. Grayscale (Rec.709)
 //   3. Annular working zone:
-//        r < innerRad (1 mm)  → forced dark  (anatomical pupil floor)
-//        r > outerRad (4 mm)  → excluded     (only iris/limbus beyond here)
-//        ring between the two → goes to blur + Otsu
-//   4. 3×3 box blur on ring pixels only — kills single-pixel noise/speckle
-//   5. Otsu threshold on the ring histogram → finds iris/pupil boundary
-//   6. Full dark mask = inner disk ∪ ring pixels below Otsu threshold
+//        r < innerRad (1 mm)  → [commented out — inner disk forced dark]
+//        r > outerRad (4 mm)  → excluded (only iris/limbus beyond here)
+//        ring between the two → blur + normalize + threshold
+//   4. Lid exclusion: zone-2 pixels above upperLidY or below lowerLidY
+//        (with LID_BUF margin) are excluded — kills lid/lash dark regions
+//   5. 3×3 box blur on ring pixels only
+//   6. Trimmed-mean normalization: compute mean of bottom 90% of ring values,
+//        scale so mean→128, apply fixed threshold at 70 (≈0.55×128)
 //   7. Second-order central moments → best-fit circle radius
-//        r = 2·sqrt((σx²+σy²)/2)  more robust than sqrt(area/π) for
-//        partially occluded or asymmetric pupils
-//   8. Centroid gate: blob centroid must be within 25% of irisRad from center
-//   9. Hard clamp: return radius only if result is in [1 mm, 4 mm] equivalent
+//   8. Centroid gate: blob centroid within 25% of irisRad from center
+//   9. Hard clamp: [1 mm, 4 mm] anatomical bounds
 //
-// Iris diameter assumed ~11.7 mm → mmPerPx = irisMm / irisHorizPx
-// Inner 1 mm radius  = irisRad × (1   / 5.85) ≈ irisRad × 0.171
-// Outer 4 mm radius  = irisRad × (4   / 5.85) ≈ irisRad × 0.683
-// These constants are derived from irisMm=11.7, so irisRad = 5.85 mm equivalent.
+// upperLidY / lowerLidY are in VIDEO pixel space (from MediaPipe landmarks).
+
+const LID_BUF = 3; // px margin inside lid landmarks before excluding
 
 const _pupilCanvas=document.createElement('canvas');
 const _pupilCtx=_pupilCanvas.getContext('2d',{willReadFrequently:true});
 
-function measurePupil(vid, cx, cy, irisRad){
+function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   if(!vid||!vid.videoWidth||irisRad<4)return null;
 
   const vw=vid.videoWidth, vh=vid.videoHeight;
-  const size=Math.round(irisRad*2)*2;  // even, covers full iris diameter
+  const size=Math.round(irisRad*2)*2;
   const half=size/2;
   const srcX=Math.round(cx-half), srcY=Math.round(cy-half);
   if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh)return null;
@@ -595,32 +595,35 @@ function measurePupil(vid, cx, cy, irisRad){
   _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
   const {data}=_pupilCtx.getImageData(0,0,size,size);
 
-  // ── Anatomical radius limits in pixel units ──────────────────────────────
-  // iris radius ≈ 5.85 mm → scale factor = irisRad / 5.85
+  // ── Anatomical radius limits ──────────────────────────────────────────────
   const mmToPx  = irisRad / 5.85;
-  const innerR  = 1.0 * mmToPx;   // 1 mm  — pupil floor, always dark
-  const outerR  = 4.0 * mmToPx;   // 4 mm  — max pupil radius, clamp beyond
-  const innerR2 = innerR * innerR;
+  // const innerR  = 1.0 * mmToPx;  // [v4 inner disk — commented out, off-center artifact]
+  // const innerR2 = innerR * innerR;
+  const outerR  = 4.0 * mmToPx;
   const outerR2 = outerR * outerR;
   const cx2=half, cy2=half;
 
+  // Lid Y coords converted to crop-local space
+  const lidTopY    = upperLidY != null ? (upperLidY - srcY) + LID_BUF  : -1;
+  const lidBotY    = lowerLidY != null ? (lowerLidY - srcY) - LID_BUF  : size+1;
+
   // ── Pass 1: grayscale + zone classification ──────────────────────────────
-  // zone: 0=outside, 1=inner disk (forced dark), 2=ring (threshold zone)
   const gray = new Float32Array(size*size);
-  const zone = new Uint8Array(size*size);   // 0/1/2
+  const zone = new Uint8Array(size*size);  // 0=outside, 2=ring (no zone 1 now)
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
       const dx=x-cx2, dy=y-cy2;
       const r2=dx*dx+dy*dy;
-      if(r2>outerR2) continue;             // outside working zone
+      if(r2>outerR2) continue;
+      // Lid exclusion: skip pixels outside the open-eye band
+      if(y < lidTopY || y > lidBotY) continue;
       const i=(y*size+x)*4;
-      const g=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
-      gray[y*size+x]=g;
-      zone[y*size+x]= r2<=innerR2 ? 1 : 2; // 1=inner forced-dark, 2=ring
+      gray[y*size+x]=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
+      zone[y*size+x]=2;
     }
   }
 
-  // ── Pass 2: 3×3 box blur on ring pixels only ────────────────────────────
+  // ── Pass 2: 3×3 box blur on zone-2 pixels ────────────────────────────────
   const blurred = new Float32Array(size*size);
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
@@ -630,75 +633,58 @@ function measurePupil(vid, cx, cy, irisRad){
         for(let dx=-1;dx<=1;dx++){
           const ny=y+dy, nx=x+dx;
           if(ny<0||ny>=size||nx<0||nx>=size) continue;
-          const z=zone[ny*size+nx];
-          if(z===0) continue;              // don't pull in outside pixels
-          // inner disk contributes 0 luminance (it IS the dark pupil seed)
-          s += z===1 ? 0 : gray[ny*size+nx];
-          n++;
+          if(zone[ny*size+nx]===0) continue;
+          s+=gray[ny*size+nx]; n++;
         }
       }
       blurred[y*size+x] = n>0 ? s/n : gray[y*size+x];
     }
   }
 
-  // ── Pass 3: trimmed-mean normalization + fixed threshold ─────────────────
-  // Collect ring pixel values, sort, drop top 10% (specular/flash highlights),
-  // compute mean of the remainder. Scale all ring pixels so that mean → 128.
-  // Then apply a fixed threshold of 70 (≈ 0.55 × 128) — same ratio as the
-  // original approach but now on a standardized brightness scale, so it works
-  // equally well in dim and bright conditions.
+  // ── Pass 3: trimmed-mean normalization + fixed threshold ──────────────────
   const ringVals = [];
-  for(let i = 0; i < size*size; i++){
-    if(zone[i] === 2) ringVals.push(blurred[i]);
+  for(let i=0;i<size*size;i++){
+    if(zone[i]===2) ringVals.push(blurred[i]);
   }
-  if(ringVals.length < 16) return null;
-  ringVals.sort((a,b) => a-b);
-  const trimN = Math.floor(ringVals.length * 0.90); // drop top 10%
-  let trimSum = 0;
-  for(let i = 0; i < trimN; i++) trimSum += ringVals[i];
-  const trimMean = trimSum / trimN;
-  if(trimMean < 1) return null;  // iris completely black — can't normalize
-  const scale = 128 / trimMean;
-  const THRESH = 70;             // fixed threshold on normalized scale (≈0.55×128)
+  if(ringVals.length<16) return null;
+  ringVals.sort((a,b)=>a-b);
+  const trimN = Math.floor(ringVals.length*0.90);
+  let trimSum=0;
+  for(let i=0;i<trimN;i++) trimSum+=ringVals[i];
+  const trimMean = trimSum/trimN;
+  if(trimMean<1) return null;
+  const scale = 128/trimMean;
+  const THRESH = 70;
 
-  // ── Pass 4: build dark mask ─────────────────────────────────────────────
-  // inner disk = always dark; ring pixels whose normalized value ≤ THRESH = dark
+  // ── Pass 4: moments on dark mask ─────────────────────────────────────────
   let m00=0, m10=0, m01=0, m20=0, m02=0;
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
       const idx=y*size+x;
-      const z=zone[idx];
-      if(z===0) continue;
-      const normVal = z===2 ? blurred[idx]*scale : 0;
-      const dark = z===1 || normVal<=THRESH;
-      if(!dark) continue;
-      // accumulate moments
-      m00++;
-      m10+=x; m01+=y;
-      m20+=x*x; m02+=y*y;
+      if(zone[idx]!==2) continue;
+      if(blurred[idx]*scale > THRESH) continue;
+      m00++; m10+=x; m01+=y; m20+=x*x; m02+=y*y;
     }
   }
   if(m00<4) return null;
 
-  // ── Pass 5: centroid gate ────────────────────────────────────────────────
+  // ── Pass 5: centroid gate ─────────────────────────────────────────────────
   const centX=m10/m00, centY=m01/m00;
-  const centDx=centX-cx2, centDy=centY-cy2;
-  const centDist=Math.sqrt(centDx*centDx+centDy*centDy);
-  if(centDist > irisRad*0.25) return null;  // blob not centred on pupil axis
+  const centDist=Math.sqrt((centX-cx2)**2+(centY-cy2)**2);
+  if(centDist > irisRad*0.25) return null;
 
-  // ── Pass 6: second-order central moments → best-fit circle radius ────────
-  // μ20 = m20/m00 - cx², μ02 = m02/m00 - cy²
-  // σ² = (μ20 + μ02) / 2   →  radius of equivalent circle = 2·sqrt(σ²)
-  const mu20 = m20/m00 - centX*centX;
-  const mu02 = m02/m00 - centY*centY;
-  const sigma2 = (mu20+mu02)/2;
+  // ── Pass 6: second-order central moments → radius ────────────────────────
+  const mu20=m20/m00-centX*centX;
+  const mu02=m02/m00-centY*centY;
+  const sigma2=(mu20+mu02)/2;
   if(sigma2<=0) return null;
-  const pupilRad = 2*Math.sqrt(sigma2);
+  const pupilRad=2*Math.sqrt(sigma2);
 
-  // ── Hard clamp: must be within anatomical bounds ─────────────────────────
-  if(pupilRad < innerR || pupilRad > outerR) return null;
+  // ── Hard clamp ────────────────────────────────────────────────────────────
+  const innerR = 1.0 * mmToPx;
+  if(pupilRad<innerR||pupilRad>outerR) return null;
 
-  return pupilRad;  // video pixel units, radius
+  return pupilRad;
 }
 
 // ── Eye Aspect Ratio (blink detection) ───────────────────────────────────
@@ -743,8 +729,10 @@ function measure(kps){
   const valid=lOpen&&rOpen&&lRad>3&&rRad>3&&tiltR<2.0;
 
   // Measure actual pupil size from video pixels using iris center as anchor
-  const lPupilPx = measurePupil(video, kps[468].x, kps[468].y, lRad);
-  const rPupilPx = measurePupil(video, kps[473].x, kps[473].y, rRad);
+  const lUpperLidY = kps[386].y, lLowerLidY = kps[374].y;
+  const rUpperLidY = kps[159].y, rLowerLidY = kps[145].y;
+  const lPupilPx = measurePupil(video, kps[468].x, kps[468].y, lRad, lUpperLidY, lLowerLidY);
+  const rPupilPx = measurePupil(video, kps[473].x, kps[473].y, rRad, rUpperLidY, rLowerLidY);
 
   const lIrisMm  = lMmPerPx ? lHorizPx * lMmPerPx : null;  // = irisMmL (sanity check)
   const rIrisMm  = rMmPerPx ? rHorizPx * rMmPerPx : null;  // = irisMmR
@@ -761,6 +749,7 @@ function measure(kps){
     rTopOk: rIris.topOk, rBotOk: rIris.botOk,
     lCx:kps[468].x, lCy:kps[468].y,
     rCx:kps[473].x, rCy:kps[473].y,
+    lUpperLidY, lLowerLidY, rUpperLidY, rLowerLidY,
     lEAR, rEAR, lOpen, rOpen,
     quality, tiltR, valid,
     lPupilMm, rPupilMm, lIrisMm, rIrisMm,
@@ -886,9 +875,11 @@ function drawWave(){
 }
 
 // ── Validation frame capture ──────────────────────────────────────────────
-// Captures a 2-row composite for each eye: RGB crop (top) + threshold mask (bottom).
-// Called every frame during trial when validation mode is on and we're within
-// the ±50–300 ms windows around flash-on or flash-off.
+// Phase-aware cadence:
+//   adapt / baseline / recovery : 1 frame every 2 s
+//   flash window (-50 to +50ms) : 1 frame every ~100 ms, hard cap 1 s total
+// Each frame: 2-row composite per eye — RGB crop (top) + v4 threshold mask (bottom).
+// Estimated pupil circle drawn on RGB row in cyan.
 const _valCanvas = document.createElement('canvas');
 const _valCtx    = _valCanvas.getContext('2d', {willReadFrequently: true});
 
@@ -897,34 +888,39 @@ function captureValidationFrame(m, elapsed_ms){
   if(!S.trialRunning) return;
 
   const now = Date.now();
-  const windows = [];
 
-  if(S.flashOnTime){
+  // ── Phase-aware throttle ─────────────────────────────────────────────────
+  const inFlashWindow = S.flashOnTime && (() => {
     const dt = now - S.flashOnTime;
-    // ON window: 50ms before flash on, through end of flash + 300ms post-off
-    // flashOffTime may not be set yet (still in flash) — use a large sentinel
-    const flashDur = S.flashOffTime ? (S.flashOffTime - S.flashOnTime) : 999999;
-    if(dt >= -50 && dt <= flashDur + 300) windows.push({label:'ON', dt});
-  }
-  if(S.flashOffTime){
-    const dt = now - S.flashOffTime;
-    // OFF window: 50ms before flash off through 300ms after — catches rebound
-    if(dt >= -50 && dt <= 300) windows.push({label:'OFF', dt});
-  }
-  if(!windows.length) return;
+    return dt >= -50 && dt <= 50;
+  })();
 
-  // For each eye, crop the iris region from the live video, then build threshold mask
+  if(inFlashWindow){
+    // Flash window: every 100 ms, hard cap 1 s of flash frames total
+    const flashFrameCount = S.valFrames.filter(f => f.window==='FLASH').length;
+    if(flashFrameCount >= 10) return;                         // 1 s cap at 100 ms/frame
+    if(now - (S.lastValFrameTime||0) < 100) return;
+  } else {
+    // Background phases: every 2 s
+    if(now - (S.lastValFrameTime||0) < 2000) return;
+  }
+
+  S.lastValFrameTime = now;
+  const windowLabel = inFlashWindow ? 'FLASH' : currentPhase.toUpperCase()||'—';
+  const dtFlash = S.flashOnTime ? now - S.flashOnTime : null;
+
+  // ── Build composite ──────────────────────────────────────────────────────
   const eyes = [
-    {tag:'L', cx:m.lCx, cy:m.lCy, irisRad:m.lRad, pupilPx:m.lPupilPx},
-    {tag:'R', cx:m.rCx, cy:m.rCy, irisRad:m.rRad, pupilPx:m.rPupilPx},
+    {tag:'L', cx:m.lCx, cy:m.lCy, irisRad:m.lRad, pupilPx:m.lPupilPx,
+     upperLidY:m.lUpperLidY, lowerLidY:m.lLowerLidY},
+    {tag:'R', cx:m.rCx, cy:m.rCy, irisRad:m.rRad, pupilPx:m.rPupilPx,
+     upperLidY:m.rUpperLidY, lowerLidY:m.rLowerLidY},
   ];
 
-  const CELL = 120;          // each crop scaled to this square
-  const ROWS  = 2;           // row 0: RGB, row 1: threshold
-  const COLS  = eyes.length; // 2 eyes side by side
-  const PAD   = 18;          // label bar height
-  const W     = CELL * COLS;
-  const H     = CELL * ROWS + PAD;
+  const CELL = 120;
+  const PAD  = 18;
+  const W    = CELL * eyes.length;
+  const H    = CELL * 2 + PAD;
 
   _valCanvas.width  = W;
   _valCanvas.height = H;
@@ -934,7 +930,7 @@ function captureValidationFrame(m, elapsed_ms){
   const vw = video.videoWidth, vh = video.videoHeight;
 
   eyes.forEach((eye, col) => {
-    const {cx, cy, irisRad} = eye;
+    const {cx, cy, irisRad, pupilPx, upperLidY, lowerLidY} = eye;
     if(!vw || irisRad < 4) return;
 
     const size = Math.round(irisRad * 2) * 2;
@@ -943,19 +939,50 @@ function captureValidationFrame(m, elapsed_ms){
     const srcY = Math.round(cy - half);
     if(srcX < 0 || srcY < 0 || srcX + size > vw || srcY + size > vh) return;
 
-    // ── Row 0: RGB crop ──────────────────────────────────────────────────
+    // scale factor: crop pixels → CELL pixels
+    const sc = CELL / size;
+
+    // ── Row 0: RGB crop ────────────────────────────────────────────────────
     _valCtx.drawImage(video, srcX, srcY, size, size,
                       col * CELL, PAD, CELL, CELL);
 
-    // Draw iris circle outline on RGB row
+    // Iris circle
     _valCtx.beginPath();
-    _valCtx.arc(col * CELL + CELL/2, PAD + CELL/2, CELL/2 - 1, 0, Math.PI*2);
+    _valCtx.arc(col*CELL + CELL/2, PAD + CELL/2, CELL/2 - 1, 0, Math.PI*2);
     _valCtx.strokeStyle = col===0 ? 'rgba(123,143,255,.6)' : 'rgba(255,107,157,.6)';
-    _valCtx.lineWidth = 1;
-    _valCtx.stroke();
+    _valCtx.lineWidth = 1; _valCtx.stroke();
 
-    // ── Row 1: v4 threshold mask ─────────────────────────────────────────
-    // Mirrors the measurePupil v4 pipeline exactly so validation is honest.
+    // Estimated pupil circle (cyan) — drawn at the returned radius
+    if(pupilPx != null && pupilPx > 0){
+      const dispR = pupilPx * sc;
+      _valCtx.beginPath();
+      _valCtx.arc(col*CELL + CELL/2, PAD + CELL/2, dispR, 0, Math.PI*2);
+      _valCtx.strokeStyle = 'rgba(0,255,220,.9)';
+      _valCtx.lineWidth = 1.5; _valCtx.stroke();
+    }
+
+    // Lid exclusion lines (yellow dashes)
+    if(upperLidY != null){
+      const uy = PAD + (upperLidY - srcY) * sc;
+      _valCtx.setLineDash([3,3]);
+      _valCtx.strokeStyle = 'rgba(255,220,40,.6)';
+      _valCtx.lineWidth = 1;
+      _valCtx.beginPath();
+      _valCtx.moveTo(col*CELL, uy); _valCtx.lineTo(col*CELL+CELL, uy);
+      _valCtx.stroke();
+    }
+    if(lowerLidY != null){
+      const ly = PAD + (lowerLidY - srcY) * sc;
+      _valCtx.setLineDash([3,3]);
+      _valCtx.strokeStyle = 'rgba(255,220,40,.6)';
+      _valCtx.lineWidth = 1;
+      _valCtx.beginPath();
+      _valCtx.moveTo(col*CELL, ly); _valCtx.lineTo(col*CELL+CELL, ly);
+      _valCtx.stroke();
+    }
+    _valCtx.setLineDash([]);
+
+    // ── Row 1: v4 threshold mask ───────────────────────────────────────────
     const tmp = document.createElement('canvas');
     tmp.width = size; tmp.height = size;
     const tc  = tmp.getContext('2d', {willReadFrequently: true});
@@ -964,128 +991,129 @@ function captureValidationFrame(m, elapsed_ms){
     const pxd  = imgd.data;
 
     const cx2 = half, cy2 = half;
-    const mmToPx  = irisRad / 5.85;
-    const innerR  = 1.0 * mmToPx, innerR2 = innerR * innerR;
-    const outerR  = 4.0 * mmToPx, outerR2 = outerR * outerR;
+    const mmToPx2 = irisRad / 5.85;
+    // const innerR2b = (1.0*mmToPx2)**2;  // [inner disk commented out]
+    const outerR2b = (4.0*mmToPx2)**2;
+    const lidTopY2 = upperLidY != null ? (upperLidY - srcY) + LID_BUF : -1;
+    const lidBotY2 = lowerLidY != null ? (lowerLidY - srcY) - LID_BUF : size+1;
 
-    // Grayscale + zone classification
-    const gray = new Float32Array(size * size);
+    const grayV = new Float32Array(size * size);
     const zoneV = new Uint8Array(size * size);
     for(let y = 0; y < size; y++){
       for(let x = 0; x < size; x++){
-        const dx = x - cx2, dy = y - cy2, r2 = dx*dx + dy*dy;
-        if(r2 > outerR2) continue;
-        const i = (y * size + x) * 4;
-        gray[y*size+x] = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
-        zoneV[y*size+x] = r2 <= innerR2 ? 1 : 2;
+        const dx = x-cx2, dy = y-cy2, r2 = dx*dx+dy*dy;
+        if(r2 > outerR2b) continue;
+        if(y < lidTopY2 || y > lidBotY2) continue;
+        const i = (y*size+x)*4;
+        grayV[y*size+x] = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
+        zoneV[y*size+x] = 2;
       }
     }
 
-    // 3×3 box blur on ring
-    const blurred = new Float32Array(size * size);
+    // 3×3 box blur
+    const blurV = new Float32Array(size * size);
     for(let y = 0; y < size; y++){
       for(let x = 0; x < size; x++){
         if(zoneV[y*size+x] !== 2) continue;
         let s = 0, n = 0;
         for(let dy = -1; dy <= 1; dy++){
           for(let dx = -1; dx <= 1; dx++){
-            const ny = y+dy, nx = x+dx;
+            const ny=y+dy, nx=x+dx;
             if(ny<0||ny>=size||nx<0||nx>=size) continue;
-            const z = zoneV[ny*size+nx];
-            if(z===0) continue;
-            s += z===1 ? 0 : gray[ny*size+nx]; n++;
+            if(zoneV[ny*size+nx]===0) continue;
+            s += grayV[ny*size+nx]; n++;
           }
         }
-        blurred[y*size+x] = n > 0 ? s/n : gray[y*size+x];
+        blurV[y*size+x] = n > 0 ? s/n : grayV[y*size+x];
       }
     }
 
-    // Trimmed-mean normalization + fixed threshold (mirrors measurePupil v4)
-    const ringVals2 = [];
-    for(let i = 0; i < size*size; i++){
-      if(zoneV[i] === 2) ringVals2.push(blurred[i]);
-    }
-    ringVals2.sort((a,b) => a-b);
-    const trimN2 = Math.floor(ringVals2.length * 0.90);
-    let trimSum2 = 0;
-    for(let i = 0; i < trimN2; i++) trimSum2 += ringVals2[i];
-    const trimMean2 = trimN2 > 0 ? trimSum2 / trimN2 : 128;
-    const scale2 = trimMean2 > 1 ? 128 / trimMean2 : 1;
-    const THRESH2 = 70;
+    // Trimmed-mean normalization
+    const rv = [];
+    for(let i = 0; i < size*size; i++) if(zoneV[i]===2) rv.push(blurV[i]);
+    rv.sort((a,b)=>a-b);
+    const tn = Math.floor(rv.length*0.90);
+    let ts = 0; for(let i=0;i<tn;i++) ts+=rv[i];
+    const tm = tn>0 ? ts/tn : 128;
+    const sc2 = tm>1 ? 128/tm : 1;
+    const THR = 70;
 
-    // Write mask pixels with zone colour coding:
-    //   bright green  = pupil (dark ring pixel, normalized ≤ 70)
-    //   yellow        = inner disk (forced dark, 1mm floor)
-    //   blue-gray     = iris ring (above threshold)
-    //   dark          = outside working zone
+    // Mask pixels
     const maskd = tc.createImageData(size, size);
     const md = maskd.data;
     for(let y = 0; y < size; y++){
       for(let x = 0; x < size; x++){
         const idx = y*size+x;
-        const i = idx * 4;
+        const i = idx*4;
         const z = zoneV[idx];
-        const normVal = z===2 ? blurred[idx]*scale2 : 0;
+        const dx=x-cx2, dy2=y-cy2, r2=dx*dx+dy2*dy2;
         if(z === 0){
-          md[i]=15; md[i+1]=15; md[i+2]=22; md[i+3]=255;
-        } else if(z === 1){
-          // inner disk: yellow — always-dark seed
-          md[i]=255; md[i+1]=220; md[i+2]=40; md[i+3]=255;
-        } else if(normVal <= THRESH2){
-          // ring pupil: bright green
+          // outside zone or lid-excluded
+          const lidExcl = (y < lidTopY2 || y > lidBotY2) && r2 <= outerR2b;
+          if(lidExcl){
+            // lid exclusion band: dim orange tint
+            md[i]=60; md[i+1]=30; md[i+2]=0; md[i+3]=255;
+          } else {
+            md[i]=15; md[i+1]=15; md[i+2]=22; md[i+3]=255;
+          }
+        } else if(blurV[idx]*sc2 <= THR){
+          // pupil: bright green
           md[i]=80; md[i+1]=255; md[i+2]=180; md[i+3]=255;
         } else {
-          // iris: blue-gray using normalized brightness
-          const v = Math.min(255, Math.round(normVal));
+          // iris: normalized blue-gray
+          const v = Math.min(255, Math.round(blurV[idx]*sc2));
           md[i]=v>>1; md[i+1]=v>>1; md[i+2]=v; md[i+3]=255;
         }
-        md[i+3]=255;
       }
     }
     tc.putImageData(maskd, 0, 0);
 
-    // Draw inner (yellow) and outer (white) radius rings on mask
-    tc.beginPath(); tc.arc(cx2,cy2,innerR,0,Math.PI*2);
-    tc.strokeStyle='rgba(255,220,40,.7)'; tc.lineWidth=1; tc.stroke();
-    tc.beginPath(); tc.arc(cx2,cy2,outerR,0,Math.PI*2);
-    tc.strokeStyle='rgba(255,255,255,.35)'; tc.lineWidth=1; tc.stroke();
+    // Outer radius ring + lid lines on mask
+    tc.beginPath(); tc.arc(cx2,cy2,4.0*mmToPx2,0,Math.PI*2);
+    tc.strokeStyle='rgba(255,255,255,.3)'; tc.lineWidth=1; tc.stroke();
+    if(upperLidY!=null){
+      tc.setLineDash([3,3]); tc.strokeStyle='rgba(255,220,40,.5)'; tc.lineWidth=1;
+      tc.beginPath(); tc.moveTo(0,lidTopY2); tc.lineTo(size,lidTopY2); tc.stroke();
+    }
+    if(lowerLidY!=null){
+      tc.setLineDash([3,3]); tc.strokeStyle='rgba(255,220,40,.5)'; tc.lineWidth=1;
+      tc.beginPath(); tc.moveTo(0,lidBotY2); tc.lineTo(size,lidBotY2); tc.stroke();
+    }
+    tc.setLineDash([]);
 
     _valCtx.drawImage(tmp, 0, 0, size, size,
                       col * CELL, PAD + CELL, CELL, CELL);
 
-    // Iris circle on mask row
+    // Iris + pupil circles on mask row
     _valCtx.beginPath();
-    _valCtx.arc(col * CELL + CELL/2, PAD + CELL + CELL/2, CELL/2 - 1, 0, Math.PI*2);
-    _valCtx.strokeStyle = 'rgba(255,255,255,.3)';
-    _valCtx.lineWidth = 1;
-    _valCtx.stroke();
+    _valCtx.arc(col*CELL+CELL/2, PAD+CELL+CELL/2, CELL/2-1, 0, Math.PI*2);
+    _valCtx.strokeStyle='rgba(255,255,255,.2)'; _valCtx.lineWidth=1; _valCtx.stroke();
+    if(pupilPx != null && pupilPx > 0){
+      _valCtx.beginPath();
+      _valCtx.arc(col*CELL+CELL/2, PAD+CELL+CELL/2, pupilPx*sc, 0, Math.PI*2);
+      _valCtx.strokeStyle='rgba(0,255,220,.7)'; _valCtx.lineWidth=1.5; _valCtx.stroke();
+    }
 
     // Eye label
     _valCtx.fillStyle = col===0 ? '#7b8fff' : '#ff6b9d';
     _valCtx.font = '9px Space Mono,monospace';
-    _valCtx.fillText(eye.tag, col * CELL + 3, PAD - 4);
+    _valCtx.fillText(eye.tag, col*CELL+3, PAD-4);
   });
 
-  // Top label bar
-  windows.forEach(w => {
-    const sign = w.dt >= 0 ? '+' : '';
-    const lPx = m.lPupilPx!=null ? m.lPupilPx.toFixed(1)+'px' : 'null';
-    const rPx = m.rPupilPx!=null ? m.rPupilPx.toFixed(1)+'px' : 'null';
-    const lMm = m.lPupilMm!=null ? m.lPupilMm.toFixed(2)+'mm' : '';
-    const rMm = m.rPupilMm!=null ? m.rPupilMm.toFixed(2)+'mm' : '';
-    const label = `FL:${w.label} ${sign}${w.dt}ms t=${elapsed_ms}ms  L:${lPx}${lMm?'/'+lMm:''} R:${rPx}${rMm?'/'+rMm:''}`;
-    _valCtx.fillStyle = w.label==='ON' ? 'rgba(255,183,71,.9)' : 'rgba(74,240,200,.9)';
-    _valCtx.font = 'bold 9px Space Mono,monospace';
-    _valCtx.fillText(label, 2, 11);
+  // ── Label bar ─────────────────────────────────────────────────────────────
+  const sign = dtFlash!=null ? (dtFlash>=0?'+':'') : '';
+  const dtStr = dtFlash!=null ? ` ${sign}${Math.round(dtFlash)}ms` : '';
+  const lPx = m.lPupilPx!=null ? m.lPupilPx.toFixed(1)+'px' : 'null';
+  const rPx = m.rPupilPx!=null ? m.rPupilPx.toFixed(1)+'px' : 'null';
+  const lMm = m.lPupilMm!=null ? '/'+m.lPupilMm.toFixed(2)+'mm' : '';
+  const rMm = m.rPupilMm!=null ? '/'+m.rPupilMm.toFixed(2)+'mm' : '';
+  const label = `${windowLabel}${dtStr} t=${elapsed_ms}ms  L:${lPx}${lMm} R:${rPx}${rMm}`;
+  _valCtx.fillStyle = inFlashWindow ? 'rgba(255,183,71,.9)' : 'rgba(74,240,200,.85)';
+  _valCtx.font = 'bold 9px Space Mono,monospace';
+  _valCtx.fillText(label, 2, 11);
 
-    S.valFrames.push({
-      label,
-      window: w.label,
-      dt: w.dt,
-      elapsed_ms,
-      dataURL: _valCanvas.toDataURL('image/png'),
-    });
-  });
+  S.valFrames.push({label, window:windowLabel, dt:dtFlash, elapsed_ms,
+    dataURL: _valCanvas.toDataURL('image/png')});
 }
 
 // ── UI update (only called for valid frames) ──────────────────────────────
@@ -1407,7 +1435,7 @@ async function runTrial(colorSweep=false){
   S.trialType=colorSweep?'CHROMATIC':'PLR';
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
   S.currentFlashColor=null;
-  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   // Reset EMA smoothing so trial starts from clean state
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
@@ -1504,7 +1532,7 @@ async function runDampingTrial(){
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
   S.smoothLpx=null;S.smoothRpx=null;
   _prevL=null;_prevR=null;
-  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
   $('dampBtn').classList.add('running');
   $('cam').classList.add('trial');
@@ -1882,7 +1910,7 @@ $('clearBtn').onclick=()=>{
   S.samples=[];S.hist.l=[];S.hist.r=[];S.trialData=[];S.lastResults=null;
   S.smoothLpx=S.smoothRpx=S.baselineLpx=S.baselineRpx=null;
   S.currentRep=null;
-  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;
+  S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   _prevL=_prevR=null;
   ['Lpct','Rpct'].forEach(id=>$(id).textContent='—');
   ['Ldelta','Rdelta'].forEach(id=>{$(id).textContent='Δ —';$(id).className='edelta flat';});

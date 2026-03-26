@@ -903,10 +903,10 @@ function measure(kps){
   const lOpen=lEAR>0.15, rOpen=rEAR>0.15;
 
   // ── Iris measurement: HVID-primary ───────────────────────────────────────
-  // subject LEFT  iris: center=468, eyelids upper=386 lower=374
-  // subject RIGHT iris: center=473, eyelids upper=159 lower=145
-  const lIris = measureIrisDiam(kps, 468, 386, 374);
-  const rIris = measureIrisDiam(kps, 473, 159, 145);
+  // subject RIGHT iris: center=468, eyelids upper=159 lower=145
+  // subject LEFT  iris: center=473, eyelids upper=386 lower=374
+  const lIris = measureIrisDiam(kps, 473, 386, 374);
+  const rIris = measureIrisDiam(kps, 468, 159, 145);
 
   // lRad/rRad kept for backward compat with pupil measurement + tilt ratio
   const lRad = lIris.diam / 2;
@@ -929,8 +929,8 @@ function measure(kps){
   // Measure actual pupil size from video pixels using iris center as anchor
   const lUpperLidY = kps[386].y, lLowerLidY = kps[374].y;
   const rUpperLidY = kps[159].y, rLowerLidY = kps[145].y;
-  const lResult = measurePupil(video, kps[468].x, kps[468].y, lRad, lUpperLidY, lLowerLidY);
-  const rResult = measurePupil(video, kps[473].x, kps[473].y, rRad, rUpperLidY, rLowerLidY);
+  const lResult = measurePupil(video, kps[473].x, kps[473].y, lRad, lUpperLidY, lLowerLidY);
+  const rResult = measurePupil(video, kps[468].x, kps[468].y, rRad, rUpperLidY, rLowerLidY);
   const lPupilPx   = lResult?.r   ?? null;
   const rPupilPx   = rResult?.r   ?? null;
   const lPupilConf = lResult?.conf ?? null;
@@ -949,8 +949,8 @@ function measure(kps){
     lVertDiam: lIris.vertDiam, rVertDiam: rIris.vertDiam,
     lTopOk: lIris.topOk, lBotOk: lIris.botOk,
     rTopOk: rIris.topOk, rBotOk: rIris.botOk,
-    lCx:kps[468].x, lCy:kps[468].y,
-    rCx:kps[473].x, rCy:kps[473].y,
+    lCx:kps[473].x, lCy:kps[473].y,
+    rCx:kps[468].x, rCy:kps[468].y,
     lUpperLidY, lLowerLidY, rUpperLidY, rLowerLidY,
     lEAR, rEAR, lOpen, rOpen,
     quality, tiltR, valid,
@@ -1381,6 +1381,8 @@ function captureValidationFrame(m, elapsed_ms){
     _valCtx.fillStyle = col===0 ? '#7b8fff' : '#ff6b9d';
     _valCtx.font = '9px Space Mono,monospace';
     _valCtx.fillText(eye.tag, col*CELL+3, PAD-4);
+
+  }); // end eyes.forEach
 
   // ── Label bar ─────────────────────────────────────────────────────────────
   const sign = dtFlash!=null ? (dtFlash>=0?'+':'') : '';

@@ -10,7 +10,7 @@
 <link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="manifest" href="manifest.json">
-<title>PupilLens v5</title>
+<title>PupilLens v6</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -173,7 +173,7 @@ table.res td.bad{color:var(--accent3)}
 <div id="app">
   <header>
     <div class="logo">Pupil<span>Lens</span></div>
-    <span class="v3badge">v5</span>
+    <span class="v3badge">v6</span>
     <div style="font-family:var(--mono);font-size:11px;color:var(--dim)">PLR Protocol</div>
     <div class="pill"><div class="dot" id="dot"></div><span id="stxt">IDLE</span></div>
   </header>
@@ -191,7 +191,7 @@ table.res td.bad{color:var(--accent3)}
 
     <div id="splash">
       <div class="eye-icon">👁</div>
-      <h2>PupilLens v5</h2>
+      <h2>PupilLens v6</h2>
       <p>Iris tracking + PLR protocol. Tracks % change in pupil size — the real signal.</p>
       <button class="btn-start" id="startBtn">Start Camera</button>
       <div class="hint">· Dim room for best results<br>· 35–50 cm from screen<br>· Look straight at camera</div>
@@ -557,178 +557,116 @@ function measureIrisDiam(kps, ci, upperLidIdx, lowerLidIdx){
   return { diam, horizDiam, vertDiam, horizRad, topOk, botOk };
 }
 
-// ── Pupil measurement v5 — ExCuSe-style edge-based ellipse fit ───────────
+// ── Pupil measurement v6 ─────────────────────────────────────────────────
+// Pipeline (ElSe/PuRe-inspired, starburst→Taubin):
+//   1.  Crop, grayscale, lid exclusion, 4mm radial clamp
+//   2.  Specular mask (top 5% → local mean)
+//   3.  5×5 Gaussian blur
+//   4.  Sobel gradient (magnitude + angle)
+//   5.  Non-maximum suppression → 1-px thin edges
+//   6.  Canny hysteresis (strong=0.3×max, weak=0.1×max)
+//   7.  Morphological thinning: remove T-junctions (>3 neighbours) and
+//       L-corners (two perpendicular cardinal neighbours) — ElSe/PuRe style
+//   8.  Connected component labeling — find isophotes
+//   9.  Per-contour filter (ElSe/PuRe): min 10px, mean within irisRad×0.4
+//       of iris center, inner region darker than outer ring (photometric)
+//  10.  Starburst: 24 rays from iris center, first surviving-contour edge
+//       hit per ray in [innerR, outerR]
+//  11.  Taubin circle fit on ray hits (numerically stable, no eigensystem)
+//  12.  PuRe outline contrast: sample 24 radial chords, inner<outer check
+//  13.  Return {r, conf} — radius in px, confidence 0–1
 //
-// Pipeline (inspired by Świrski 2012 / ExCuSe / PuRe):
-//   1.  Crop iris region, grayscale (Rec.709)
-//   2.  Lid exclusion + 4mm radial clamp (same as v4)
-//   3.  Specular reflection mask: pixels above 95th-percentile → replaced
-//       with local mean so they contribute no edge signal
-//   4.  5×5 separable Gaussian blur (σ≈1.0) for noise suppression
-//   5.  Sobel gradient: magnitude G and angle θ at every zone pixel
-//   6.  Non-maximum suppression: thin to 1-px-wide ridges
-//   7.  Edge direction filter: keep only edges whose gradient points
-//       OUTWARD from the iris center (dark-inside → bright-outside = pupil
-//       boundary). This is the key step that survives flash — the boundary
-//       edge exists even when the pupil interior is blown out.
-//   8.  Double-threshold hysteresis (Canny): strong=0.35×max, weak=0.15×max
-//   9.  Fitzgibbon direct least-squares ellipse fit to surviving edge pixels
-//  10.  Validate: center near iris landmark, axes in [1mm,4mm], aspect≥0.5
-//  11.  Return mean semi-axis as pupil radius
-//
-// All in pure JS, zero dependencies.
+// Returns null on failure, {r, conf} on success.
 
 const LID_BUF = 4;
+const STARBURST_RAYS = 24;
 
 const _pupilCanvas = document.createElement('canvas');
 const _pupilCtx    = _pupilCanvas.getContext('2d', {willReadFrequently:true});
 
-// ── 5×5 separable Gaussian [1,4,6,4,1]/16 ───────────────────────────────
+// ── 5×5 separable Gaussian [1,4,6,4,1]/16 ──────────────────────────────
 function gaussianBlur5(src, dst, w, h, mask){
-  const K=[1,4,6,4,1], KS=16;
+  const K=[1,4,6,4,1];
   const tmp=new Float32Array(w*h);
-  // horizontal pass
-  for(let y=0;y<h;y++){
-    for(let x=0;x<w;x++){
-      if(!mask[y*w+x]){continue;}
-      let s=0,n=0;
-      for(let k=-2;k<=2;k++){
-        const nx=x+k;
-        if(nx<0||nx>=w||!mask[y*w+nx]) continue;
-        s+=src[y*w+nx]*K[k+2]; n+=K[k+2];
-      }
-      tmp[y*w+x]=n?s/n:src[y*w+x];
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    if(!mask[y*w+x]) continue;
+    let s=0,n=0;
+    for(let k=-2;k<=2;k++){
+      const nx=x+k;
+      if(nx<0||nx>=w||!mask[y*w+nx]) continue;
+      s+=src[y*w+nx]*K[k+2]; n+=K[k+2];
     }
+    tmp[y*w+x]=n?s/n:src[y*w+x];
   }
-  // vertical pass
-  for(let y=0;y<h;y++){
-    for(let x=0;x<w;x++){
-      if(!mask[y*w+x]){dst[y*w+x]=0;continue;}
-      let s=0,n=0;
-      for(let k=-2;k<=2;k++){
-        const ny=y+k;
-        if(ny<0||ny>=h||!mask[ny*w+x]) continue;
-        s+=tmp[ny*w+x]*K[k+2]; n+=K[k+2];
-      }
-      dst[y*w+x]=n?s/n:tmp[y*w+x];
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    if(!mask[y*w+x]){dst[y*w+x]=0;continue;}
+    let s=0,n=0;
+    for(let k=-2;k<=2;k++){
+      const ny=y+k;
+      if(ny<0||ny>=h||!mask[ny*w+x]) continue;
+      s+=tmp[ny*w+x]*K[k+2]; n+=K[k+2];
     }
+    dst[y*w+x]=n?s/n:tmp[y*w+x];
   }
 }
 
-// ── Fitzgibbon direct ellipse fit ────────────────────────────────────────
-// Fits ax²+bxy+cy²+dx+ey+f=0 with constraint 4ac-b²=1 (ellipse-specific).
-// Input: arrays of x,y coords. Returns {cx,cy,a,b} (center + semi-axes) or null.
-function fitEllipse(xs, ys){
+// ── Taubin circle fit ────────────────────────────────────────────────────
+// Minimises algebraic distance with Taubin's normalization.
+// Input: arrays xs[], ys[]. Returns {cx,cy,r} or null.
+// Solves a 4×4 eigenproblem reduced to 3×3 via centering — numerically
+// stable, no power iteration.
+function taubinCircle(xs, ys){
   const n=xs.length;
-  if(n<6) return null;
+  if(n<3) return null;
 
-  // Design matrix D (n×6): [x², xy, y², x, y, 1]
-  const D=[];
+  // Centre the data
+  let mx=0,my=0;
+  for(let i=0;i<n;i++){mx+=xs[i];my+=ys[i];}
+  mx/=n; my/=n;
+
+  // Moments: Mxx, Myy, Mxy, Mxz, Myz, Mzz  where z=x²+y²
+  let Mxx=0,Myy=0,Mxy=0,Mxz=0,Myz=0,Mzz=0;
   for(let i=0;i<n;i++){
-    const x=xs[i],y=ys[i];
-    D.push([x*x, x*y, y*y, x, y, 1]);
+    const x=xs[i]-mx, y=ys[i]-my, z=x*x+y*y;
+    Mxx+=x*x; Myy+=y*y; Mxy+=x*y;
+    Mxz+=x*z; Myz+=y*z; Mzz+=z*z;
+  }
+  Mxx/=n; Myy/=n; Mxy/=n; Mxz/=n; Myz/=n; Mzz/=n;
+
+  // Coefficient matrix M (Taubin eq 25)
+  const Mz=Mxx+Myy;
+  const Cov_xy=Mxx*Myy-Mxy*Mxy;
+  const A3=4*Mz;
+  const A2=-3*Mz*Mz-Mzz;
+  const A1=Mzz*Mz+4*Cov_xy*Mzz-Mxz*Mxz-Myz*Myz-Mz*Mz*Mz;
+  const A0=Mxz*Mxz*Myy+Myz*Myz*Mxx-Mzz*Cov_xy-2*Mxz*Myz*Mxy+Mz*Mz*Cov_xy;
+  const A22=A2+A2;
+  const A33=A3+A3+A3;
+
+  // Newton's method on the characteristic polynomial
+  let x=0;
+  for(let iter=0;iter<99;iter++){
+    const Dy=A0+x*(A1+x*(A2+x*A3));
+    const Dy1=A1+x*(A22+x*A33);
+    const dx=Dy/Dy1;
+    x-=dx;
+    if(Math.abs(dx)<1e-12) break;
   }
 
-  // Scatter matrix S = Dᵀ D  (6×6)
-  const S=Array.from({length:6},()=>new Float64Array(6));
-  for(let i=0;i<n;i++){
-    for(let r=0;r<6;r++) for(let c=0;c<6;c++) S[r][c]+=D[i][r]*D[i][c];
-  }
+  // Extract circle parameters
+  const DET=x*x-x*Mz+Cov_xy;
+  if(Math.abs(DET)<1e-10) return null;
+  const Xcenter=(Mxz*(Myy-x)-Myz*Mxy)/(2*DET);
+  const Ycenter=(Myz*(Mxx-x)-Mxz*Mxy)/(2*DET);
 
-  // Constraint matrix C for ellipse: C[0][2]=C[2][0]=2, C[1][1]=-1
-  const C=Array.from({length:6},()=>new Float64Array(6));
-  C[0][2]=2; C[2][0]=2; C[1][1]=-1;
+  const r=Math.sqrt(Xcenter*Xcenter+Ycenter*Ycenter+Mz+2*x);
+  if(!isFinite(r)||r<=0) return null;
 
-  // Solve generalised eigensystem S·a = λ·C·a
-  // We use the algebraic reduction from Fitzgibbon 1999:
-  // partition S into S11(3×3 top-left), S12, S21, S22
-  // then solve reduced 3×3 system M = S22⁻¹·S21·S11⁻¹·S12 ... 
-  // For robustness we use a simple power-iteration on (S⁻¹C) restricted
-  // to the ellipse subspace — but full Fitzgibbon needs a real eigensolver.
-  // We implement the compact version via LU decomposition of the 6×6 system.
-
-  // LU decompose S in-place, then solve for each of 6 unit vectors → S⁻¹
-  const Lu=S.map(r=>[...r]);
-  const piv=Array.from({length:6},(_,i)=>i);
-  for(let k=0;k<6;k++){
-    // partial pivot
-    let maxV=Math.abs(Lu[k][k]),maxR=k;
-    for(let i=k+1;i<6;i++) if(Math.abs(Lu[i][k])>maxV){maxV=Math.abs(Lu[i][k]);maxR=i;}
-    [Lu[k],Lu[maxR]]=[Lu[maxR],Lu[k]];[piv[k],piv[maxR]]=[piv[maxR],piv[k]];
-    if(Math.abs(Lu[k][k])<1e-12) return null; // singular
-    for(let i=k+1;i<6;i++){
-      Lu[i][k]/=Lu[k][k];
-      for(let j=k+1;j<6;j++) Lu[i][j]-=Lu[i][k]*Lu[k][j];
-    }
-  }
-  const luSolve=b=>{
-    const x=[...b];
-    // forward sub
-    for(let i=0;i<6;i++) for(let j=0;j<i;j++) x[i]-=Lu[i][j]*x[j];
-    // back sub
-    for(let i=5;i>=0;i--){
-      for(let j=i+1;j<6;j++) x[i]-=Lu[i][j]*x[j];
-      x[i]/=Lu[i][i];
-    }
-    return x;
-  };
-
-  // Compute S⁻¹ (6×6)
-  const Sinv=Array.from({length:6},(_,c)=>{
-    const e=new Array(6).fill(0); e[piv[c]]=1;
-    // un-pivot: solve with original pivot ordering
-    const ep=new Array(6).fill(0);
-    for(let i=0;i<6;i++) ep[i]=e[piv.indexOf(i)];
-    return luSolve(ep);
-  });
-
-  // M = S⁻¹ · C  (6×6)
-  const M=Array.from({length:6},()=>new Float64Array(6));
-  for(let r=0;r<6;r++) for(let c=0;c<6;c++)
-    for(let k=0;k<6;k++) M[r][c]+=Sinv[r][k]*C[k][c];
-
-  // Power iteration to find eigenvector with largest positive eigenvalue
-  // (the ellipse solution has exactly one positive eigenvalue)
-  let vec=new Float64Array([1,1,1,1,1,1]);
-  for(let iter=0;iter<80;iter++){
-    const nv=new Float64Array(6);
-    for(let r=0;r<6;r++) for(let c=0;c<6;c++) nv[r]+=M[r][c]*vec[c];
-    const norm=Math.sqrt(nv.reduce((s,v)=>s+v*v,0));
-    if(norm<1e-14) return null;
-    for(let i=0;i<6;i++) vec[i]=nv[i]/norm;
-  }
-  // eigenvalue sign check — we want the positive one
-  const Mv=new Float64Array(6);
-  for(let r=0;r<6;r++) for(let c=0;c<6;c++) Mv[r]+=M[r][c]*vec[c];
-  const lam=Mv.reduce((s,v,i)=>s+v*vec[i],0);
-  if(lam<0){
-    // try inverse iteration for the other sign
-    for(let i=0;i<6;i++) vec[i]=-vec[i];
-  }
-
-  // vec = [a,b,c,d,e,f] coefficients of ax²+bxy+cy²+dx+ey+f=0
-  const [a,b,c,d,e,f]=vec;
-
-  // Check it's an ellipse: b²-4ac < 0
-  if(b*b-4*a*c>=0) return null;
-
-  // Convert to geometric form (center, axes, angle)
-  const denom=b*b-4*a*c;
-  const ecx=(2*c*d-b*e)/denom;
-  const ecy=(2*a*e-b*d)/denom;
-
-  const num=2*(a*e*e+c*d*d-b*d*e+(b*b-4*a*c)*f);
-  const sq=Math.sqrt((a-c)**2+b*b);
-  const axis1=Math.abs(num/(denom*(sq-(a+c))));
-  const axis2=Math.abs(num/(denom*(-sq-(a+c))));
-  if(!isFinite(axis1)||!isFinite(axis2)||axis1<=0||axis2<=0) return null;
-
-  const semiA=Math.sqrt(axis1);
-  const semiB=Math.sqrt(axis2);
-
-  return {cx:ecx, cy:ecy, semiA, semiB};
+  return {cx:Xcenter+mx, cy:Ycenter+my, r};
 }
 
+// ── measurePupil v6 ──────────────────────────────────────────────────────
+// Returns {r, conf} or null.
 function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   if(!vid||!vid.videoWidth||irisRad<4) return null;
 
@@ -742,142 +680,208 @@ function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
   const {data}=_pupilCtx.getImageData(0,0,size,size);
 
-  const mmToPx = irisRad/5.85;
-  const outerR  = 4.0*mmToPx, outerR2=outerR*outerR;
-  const innerR  = 1.0*mmToPx;
+  const mmToPx=irisRad/5.85;
+  const outerR=4.0*mmToPx, outerR2=outerR*outerR;
+  const innerR=1.0*mmToPx;
   const cx2=half, cy2=half;
-  const lidTopY = upperLidY!=null ? (upperLidY-srcY)+LID_BUF : -1;
-  const lidBotY = lowerLidY!=null ? (lowerLidY-srcY)-LID_BUF : size+1;
+  const lidTopY=upperLidY!=null?(upperLidY-srcY)+LID_BUF:-1;
+  const lidBotY=lowerLidY!=null?(lowerLidY-srcY)-LID_BUF:size+1;
 
-  // ── Pass 1: grayscale + zone mask ────────────────────────────────────────
+  // ── 1. Grayscale + zone ──────────────────────────────────────────────────
   const gray=new Float32Array(size*size);
   const zone=new Uint8Array(size*size);
-  for(let y=0;y<size;y++){
-    for(let x=0;x<size;x++){
-      const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
-      if(r2>outerR2||y<lidTopY||y>lidBotY) continue;
-      const i=(y*size+x)*4;
-      gray[y*size+x]=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
-      zone[y*size+x]=1;
-    }
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
+    if(r2>outerR2||y<lidTopY||y>lidBotY) continue;
+    const i=(y*size+x)*4;
+    gray[y*size+x]=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
+    zone[y*size+x]=1;
   }
 
-  // ── Pass 2: specular reflection mask (top 5% brightness → local mean) ────
-  const zoneVals=[];
-  for(let i=0;i<size*size;i++) if(zone[i]) zoneVals.push(gray[i]);
-  if(zoneVals.length<20) return null;
-  zoneVals.sort((a,b)=>a-b);
-  const p95=zoneVals[Math.floor(zoneVals.length*0.95)];
-  const zoneMean=zoneVals.reduce((s,v)=>s+v,0)/zoneVals.length;
+  // ── 2. Specular mask ─────────────────────────────────────────────────────
+  const zv=[];
+  for(let i=0;i<size*size;i++) if(zone[i]) zv.push(gray[i]);
+  if(zv.length<20) return null;
+  zv.sort((a,b)=>a-b);
+  const p95=zv[Math.floor(zv.length*0.95)];
+  const zmean=zv.reduce((s,v)=>s+v,0)/zv.length;
   const masked=new Float32Array(gray);
-  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zoneMean;
+  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zmean;
 
-  // ── Pass 3: 5×5 Gaussian blur ────────────────────────────────────────────
+  // ── 3. Gaussian blur ─────────────────────────────────────────────────────
   const blurred=new Float32Array(size*size);
-  gaussianBlur5(masked, blurred, size, size, zone);
+  gaussianBlur5(masked,blurred,size,size,zone);
 
-  // ── Pass 4: Sobel gradient ───────────────────────────────────────────────
+  // ── 4. Sobel ─────────────────────────────────────────────────────────────
   const Gmag=new Float32Array(size*size);
   const Gang=new Float32Array(size*size);
-  for(let y=1;y<size-1;y++){
-    for(let x=1;x<size-1;x++){
-      if(!zone[y*size+x]) continue;
-      const p=(dy,dx)=>zone[(y+dy)*size+(x+dx)]?blurred[(y+dy)*size+(x+dx)]:blurred[y*size+x];
-      const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
-      const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
-      Gmag[y*size+x]=Math.sqrt(gx*gx+gy*gy);
-      Gang[y*size+x]=Math.atan2(gy,gx);
-    }
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!zone[y*size+x]) continue;
+    const p=(dy,dx)=>zone[(y+dy)*size+(x+dx)]?blurred[(y+dy)*size+(x+dx)]:blurred[y*size+x];
+    const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
+    const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
+    Gmag[y*size+x]=Math.sqrt(gx*gx+gy*gy);
+    Gang[y*size+x]=Math.atan2(gy,gx);
   }
 
-  // ── Pass 5: non-maximum suppression ─────────────────────────────────────
+  // ── 5. NMS ───────────────────────────────────────────────────────────────
   const nms=new Uint8Array(size*size);
-  for(let y=1;y<size-1;y++){
-    for(let x=1;x<size-1;x++){
-      if(!zone[y*size+x]||Gmag[y*size+x]===0) continue;
-      const ang=Gang[y*size+x];
-      // quantise gradient direction to 4 bins (0°,45°,90°,135°)
-      const deg=((ang*180/Math.PI)%180+180)%180;
-      let nx1,ny1,nx2,ny2;
-      if(deg<22.5||deg>=157.5){        nx1=1;ny1=0;nx2=-1;ny2=0;}
-      else if(deg<67.5) {              nx1=1;ny1=1;nx2=-1;ny2=-1;}
-      else if(deg<112.5){              nx1=0;ny1=1;nx2=0; ny2=-1;}
-      else{                            nx1=-1;ny1=1;nx2=1;ny2=-1;}
-      const m=Gmag[y*size+x];
-      const m1=zone[(y+ny1)*size+(x+nx1)]?Gmag[(y+ny1)*size+(x+nx1)]:0;
-      const m2=zone[(y+ny2)*size+(x+nx2)]?Gmag[(y+ny2)*size+(x+nx2)]:0;
-      if(m>=m1&&m>=m2) nms[y*size+x]=1;
-    }
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!zone[y*size+x]||!Gmag[y*size+x]) continue;
+    const deg=((Gang[y*size+x]*180/Math.PI)%180+180)%180;
+    let nx1,ny1,nx2,ny2;
+    if(deg<22.5||deg>=157.5)      {nx1=1;ny1=0;nx2=-1;ny2=0;}
+    else if(deg<67.5)              {nx1=1;ny1=1;nx2=-1;ny2=-1;}
+    else if(deg<112.5)             {nx1=0;ny1=1;nx2=0;ny2=-1;}
+    else                           {nx1=-1;ny1=1;nx2=1;ny2=-1;}
+    const m=Gmag[y*size+x];
+    const m1=zone[(y+ny1)*size+(x+nx1)]?Gmag[(y+ny1)*size+(x+nx1)]:0;
+    const m2=zone[(y+ny2)*size+(x+nx2)]?Gmag[(y+ny2)*size+(x+nx2)]:0;
+    if(m>=m1&&m>=m2) nms[y*size+x]=1;
   }
 
-  // ── Pass 6: edge direction filter — outward-pointing only ────────────────
-  // Pupil boundary: inside is darker than outside → gradient points outward
-  // from iris center. Keep edge pixels where dot(gradient, radialOut) > 0.
-  const edgeDir=new Uint8Array(size*size);
-  for(let y=0;y<size;y++){
-    for(let x=0;x<size;x++){
-      if(!nms[y*size+x]) continue;
-      const rx=x-cx2, ry=y-cy2;   // radial outward vector
-      const ang=Gang[y*size+x];
-      const gdx=Math.cos(ang), gdy=Math.sin(ang);
-      // dot product — keep if gradient has outward component
-      if(rx*gdx+ry*gdy > 0) edgeDir[y*size+x]=1;
-    }
-  }
-
-  // ── Pass 7: double-threshold hysteresis ──────────────────────────────────
+  // ── 6. Canny hysteresis ──────────────────────────────────────────────────
   let maxG=0;
-  for(let i=0;i<size*size;i++) if(edgeDir[i]) maxG=Math.max(maxG,Gmag[i]);
+  for(let i=0;i<size*size;i++) if(nms[i]) maxG=Math.max(maxG,Gmag[i]);
   if(maxG<1) return null;
-  const hiT=maxG*0.35, loT=maxG*0.15;
-
-  const strong=new Uint8Array(size*size);
-  const weak  =new Uint8Array(size*size);
+  const hiT=maxG*0.30, loT=maxG*0.10;
+  const strong=new Uint8Array(size*size), weak=new Uint8Array(size*size);
   for(let i=0;i<size*size;i++){
-    if(!edgeDir[i]) continue;
-    if(Gmag[i]>=hiT) strong[i]=1;
-    else if(Gmag[i]>=loT) weak[i]=1;
+    if(!nms[i]) continue;
+    if(Gmag[i]>=hiT) strong[i]=1; else if(Gmag[i]>=loT) weak[i]=1;
   }
-  // connect weak edges to strong (single-pass 8-connected)
-  for(let y=1;y<size-1;y++){
-    for(let x=1;x<size-1;x++){
-      if(!weak[y*size+x]) continue;
-      let hasStrong=false;
-      for(let dy=-1;dy<=1&&!hasStrong;dy++)
-        for(let dx=-1;dx<=1;dx++)
-          if(strong[(y+dy)*size+(x+dx)]) hasStrong=true;
-      if(hasStrong) strong[y*size+x]=1;
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!weak[y*size+x]) continue;
+    let ok=false;
+    for(let dy=-1;dy<=1&&!ok;dy++) for(let dx=-1;dx<=1;dx++) if(strong[(y+dy)*size+(x+dx)]) ok=true;
+    if(ok) strong[y*size+x]=1;
+  }
+
+  // ── 7. Morphological thinning (ElSe/PuRe filterEdges) ───────────────────
+  // Remove pixels with >3 neighbours (junction blobs) and L-corners
+  // (two perpendicular cardinal neighbours → the corner is redundant).
+  for(let y=2;y<size-2;y++) for(let x=2;x<size-2;x++){
+    if(!strong[y*size+x]) continue;
+    let neig=0;
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) if(strong[(y+dy)*size+(x+dx)]) neig++;
+    if(neig>4) {strong[y*size+x]=0; continue;}  // junction blob
+    const n=strong[(y-1)*size+x], s=strong[(y+1)*size+x];
+    const e=strong[y*size+(x+1)], w=strong[y*size+(x-1)];
+    if((e&&s)||(e&&n)||(w&&s)||(w&&n)) strong[y*size+x]=0;  // L-corner
+  }
+
+  // ── 8. Connected components ──────────────────────────────────────────────
+  // Simple flood-fill labeling; label=0 means unlabeled/background.
+  const label=new Int16Array(size*size);
+  let numLabels=0;
+  // Store per-label: pixel count, sumX, sumY
+  const compSize=[], compSx=[], compSy=[];
+
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    if(!strong[y*size+x]||label[y*size+x]) continue;
+    numLabels++;
+    const lbl=numLabels;
+    const stack=[y*size+x];
+    label[y*size+x]=lbl;
+    let cnt=0, sx=0, sy=0;
+    while(stack.length){
+      const idx=stack.pop();
+      const px=idx%size, py=(idx-px)/size;
+      cnt++; sx+=px; sy+=py;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const ny=py+dy, nx=px+dx;
+        if(ny<0||ny>=size||nx<0||nx>=size) continue;
+        const ni=ny*size+nx;
+        if(strong[ni]&&!label[ni]){label[ni]=lbl;stack.push(ni);}
+      }
+    }
+    compSize.push(cnt); compSx.push(sx); compSy.push(sy);
+  }
+
+  // ── 9. Per-contour filter ────────────────────────────────────────────────
+  // Keep label if: size≥10, mean position within irisRad×0.4 of center,
+  // inner region (r<outerR×0.5) darker than outer ring (ElSe inner_gray check).
+  const innerMeanR=outerR*0.5;
+  const innerMeanR2=innerMeanR*innerMeanR;
+  // compute mean inner/outer brightness from blurred image once
+  let innerSum=0,innerCnt=0,outerSum=0,outerCnt=0;
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    if(!zone[y*size+x]) continue;
+    const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
+    if(r2<innerMeanR2){innerSum+=blurred[y*size+x];innerCnt++;}
+    else if(r2<=outerR2){outerSum+=blurred[y*size+x];outerCnt++;}
+  }
+  const innerMean=innerCnt?innerSum/innerCnt:0;
+  const outerMean=outerCnt?outerSum/outerCnt:255;
+  const innerDarker=innerMean<outerMean-5; // at least 5 gray levels darker
+
+  const goodLabel=new Uint8Array(numLabels+1);
+  for(let l=1;l<=numLabels;l++){
+    const sz=compSize[l-1];
+    if(sz<10) continue;
+    const mx2=compSx[l-1]/sz, my2=compSy[l-1]/sz;
+    const d=Math.sqrt((mx2-cx2)**2+(my2-cy2)**2);
+    if(d>irisRad*0.4) continue;
+    if(!innerDarker) continue;
+    goodLabel[l]=1;
+  }
+
+  // Build good-pixel mask
+  const goodEdge=new Uint8Array(size*size);
+  for(let i=0;i<size*size;i++) if(label[i]&&goodLabel[label[i]]) goodEdge[i]=1;
+
+  // ── 10. Starburst: 24 rays, first good-edge hit per ray ─────────────────
+  const hitX=[], hitY=[];
+  for(let r=0;r<STARBURST_RAYS;r++){
+    const ang=r*2*Math.PI/STARBURST_RAYS;
+    const cos=Math.cos(ang), sin=Math.sin(ang);
+    // walk from innerR outward to outerR
+    for(let t=innerR;t<=outerR;t+=0.7){
+      const px=Math.round(cx2+cos*t);
+      const py=Math.round(cy2+sin*t);
+      if(px<0||px>=size||py<0||py>=size) break;
+      if(goodEdge[py*size+px]){hitX.push(px);hitY.push(py);break;}
     }
   }
 
-  // ── Pass 8: collect edge pixels ──────────────────────────────────────────
-  const ex=[],ey=[];
-  for(let y=0;y<size;y++)
-    for(let x=0;x<size;x++)
-      if(strong[y*size+x]){ex.push(x);ey.push(y);}
+  if(hitX.length<5) return null;
 
-  if(ex.length<8) return null;
+  // ── 11. Taubin circle fit ────────────────────────────────────────────────
+  const tc=taubinCircle(hitX,hitY);
+  if(!tc) return null;
+  const {cx:tcx,cy:tcy,r:tr}=tc;
 
-  // ── Pass 9: ellipse fit ───────────────────────────────────────────────────
-  const ell=fitEllipse(ex,ey);
-  if(!ell) return null;
+  // Validate center near iris landmark, radius in anatomical bounds
+  if(Math.sqrt((tcx-cx2)**2+(tcy-cy2)**2)>irisRad*0.35) return null;
+  if(tr<innerR||tr>outerR) return null;
 
-  const {cx:ecx,cy:ecy,semiA,semiB}=ell;
+  // ── 12. PuRe outline contrast ────────────────────────────────────────────
+  // Sample STARBURST_RAYS radial chords through the fitted circle.
+  // At each sample point on the circle, check inner side < outer side.
+  // confidence = fraction of samples passing.
+  const DELTA=Math.round(tr*0.15)||2; // sample span either side of boundary
+  let evaluated=0, passed=0;
+  for(let r=0;r<STARBURST_RAYS;r++){
+    const ang=r*2*Math.PI/STARBURST_RAYS;
+    const cos=Math.cos(ang), sin=Math.sin(ang);
+    // point on the fitted circle
+    const px=tcx+cos*tr, py=tcy+sin*tr;
+    // inner sample (toward center)
+    let inner=0,outer=0,ic=0,oc=0;
+    for(let d=1;d<=DELTA;d++){
+      const ix=Math.round(px-cos*d), iy=Math.round(py-sin*d);
+      const ox=Math.round(px+cos*d), oy=Math.round(py+sin*d);
+      if(ix>=0&&ix<size&&iy>=0&&iy<size&&zone[iy*size+ix]){inner+=blurred[iy*size+ix];ic++;}
+      if(ox>=0&&ox<size&&oy>=0&&oy<size&&zone[oy*size+ox]){outer+=blurred[oy*size+ox];oc++;}
+    }
+    if(!ic||!oc) continue;
+    evaluated++;
+    if(inner/ic < outer/oc-3) passed++; // inner darker than outer by ≥3 gray
+  }
+  const conf=evaluated>0?passed/evaluated:0;
+  if(conf<0.35) return null; // reject if < 35% of samples pass
 
-  // ── Pass 10: validate ─────────────────────────────────────────────────────
-  // Center must be near iris landmark
-  const centDist=Math.sqrt((ecx-cx2)**2+(ecy-cy2)**2);
-  if(centDist>irisRad*0.30) return null;
-
-  // Semi-axes must be in anatomical range [1mm, 4mm]
-  const rMin=Math.min(semiA,semiB), rMax=Math.max(semiA,semiB);
-  if(rMin<innerR||rMax>outerR) return null;
-
-  // Aspect ratio: not too elongated (handles partial occlusion gracefully)
-  if(rMin/rMax<0.45) return null;
-
-  // Return mean semi-axis as radius estimate
-  return (semiA+semiB)/2;
+  return {r:tr, conf};
 }
 
 
@@ -925,8 +929,12 @@ function measure(kps){
   // Measure actual pupil size from video pixels using iris center as anchor
   const lUpperLidY = kps[386].y, lLowerLidY = kps[374].y;
   const rUpperLidY = kps[159].y, rLowerLidY = kps[145].y;
-  const lPupilPx = measurePupil(video, kps[468].x, kps[468].y, lRad, lUpperLidY, lLowerLidY);
-  const rPupilPx = measurePupil(video, kps[473].x, kps[473].y, rRad, rUpperLidY, rLowerLidY);
+  const lResult = measurePupil(video, kps[468].x, kps[468].y, lRad, lUpperLidY, lLowerLidY);
+  const rResult = measurePupil(video, kps[473].x, kps[473].y, rRad, rUpperLidY, rLowerLidY);
+  const lPupilPx   = lResult?.r   ?? null;
+  const rPupilPx   = rResult?.r   ?? null;
+  const lPupilConf = lResult?.conf ?? null;
+  const rPupilConf = rResult?.conf ?? null;
 
   const lIrisMm  = lMmPerPx ? lHorizPx * lMmPerPx : null;  // = irisMmL (sanity check)
   const rIrisMm  = rMmPerPx ? rHorizPx * rMmPerPx : null;  // = irisMmR
@@ -948,6 +956,7 @@ function measure(kps){
     quality, tiltR, valid,
     lPupilMm, rPupilMm, lIrisMm, rIrisMm,
     lMmPerPx, rMmPerPx,
+    lPupilConf, rPupilConf,
   };
 }
 
@@ -1176,7 +1185,15 @@ function captureValidationFrame(m, elapsed_ms){
     }
     _valCtx.setLineDash([]);
 
-    // ── Row 1: v5 edge map + fitted ellipse ───────────────────────────────
+    // ── Row 1: v6 pipeline map ─────────────────────────────────────────────
+    // Re-runs the v6 pipeline on this crop and renders internals:
+    //   dim gray    = iris background (blurred)
+    //   cyan tint   = specular masked pixel
+    //   dim yellow  = thinned edge pixel (any contour, before filter)
+    //   bright green= good-contour pixel (passed size+position+photometric)
+    //   red         = rejected-contour pixel
+    //   yellow dot  = starburst ray hit
+    //   cyan circle = Taubin fitted circle
     const tmp = document.createElement('canvas');
     tmp.width = size; tmp.height = size;
     const tc  = tmp.getContext('2d', {willReadFrequently: true});
@@ -1184,133 +1201,186 @@ function captureValidationFrame(m, elapsed_ms){
     const imgd = tc.getImageData(0, 0, size, size);
     const pxd  = imgd.data;
 
-    const cx2v = half, cy2v = half;
-    const mmToPxV = irisRad / 5.85;
-    const outerRV = 4.0*mmToPxV, outerR2V = outerRV*outerRV;
-    const lidTopV = upperLidY!=null ? (upperLidY-srcY)+LID_BUF : -1;
-    const lidBotV = lowerLidY!=null ? (lowerLidY-srcY)-LID_BUF : size+1;
+    const cx2v=half, cy2v=half;
+    const mmToPxV=irisRad/5.85;
+    const outerRV=4.0*mmToPxV, outerR2V=outerRV*outerRV;
+    const innerRV=1.0*mmToPxV;
+    const lidTopV=upperLidY!=null?(upperLidY-srcY)+LID_BUF:-1;
+    const lidBotV=lowerLidY!=null?(lowerLidY-srcY)-LID_BUF:size+1;
 
     // Grayscale + zone
-    const grayV2=new Float32Array(size*size);
-    const zoneV2=new Uint8Array(size*size);
-    for(let y=0;y<size;y++){
-      for(let x=0;x<size;x++){
-        const dx=x-cx2v,dy=y-cy2v,r2=dx*dx+dy*dy;
-        if(r2>outerR2V||y<lidTopV||y>lidBotV) continue;
-        const i=(y*size+x)*4;
-        grayV2[y*size+x]=pxd[i]*0.2126+pxd[i+1]*0.7152+pxd[i+2]*0.0722;
-        zoneV2[y*size+x]=1;
-      }
+    const gV=new Float32Array(size*size), zV=new Uint8Array(size*size);
+    for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+      const dx=x-cx2v,dy=y-cy2v,r2=dx*dx+dy*dy;
+      if(r2>outerR2V||y<lidTopV||y>lidBotV) continue;
+      const i=(y*size+x)*4;
+      gV[y*size+x]=pxd[i]*0.2126+pxd[i+1]*0.7152+pxd[i+2]*0.0722; zV[y*size+x]=1;
     }
     // Specular mask
-    const zv=[];
-    for(let i=0;i<size*size;i++) if(zoneV2[i]) zv.push(grayV2[i]);
-    const p95v=zv.length?zv.slice().sort((a,b)=>a-b)[Math.floor(zv.length*0.95)]:255;
-    const meanV=zv.length?zv.reduce((s,v)=>s+v,0)/zv.length:128;
-    const maskedV=new Float32Array(grayV2);
-    for(let i=0;i<size*size;i++) if(zoneV2[i]&&maskedV[i]>p95v) maskedV[i]=meanV;
-    // Gaussian blur
-    const blurV2=new Float32Array(size*size);
-    gaussianBlur5(maskedV,blurV2,size,size,zoneV2);
-    // Sobel
-    const GmagV=new Float32Array(size*size);
-    const GangV=new Float32Array(size*size);
-    for(let y=1;y<size-1;y++){
-      for(let x=1;x<size-1;x++){
-        if(!zoneV2[y*size+x]) continue;
-        const p=(dy,dx)=>zoneV2[(y+dy)*size+(x+dx)]?blurV2[(y+dy)*size+(x+dx)]:blurV2[y*size+x];
-        const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
-        const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
-        GmagV[y*size+x]=Math.sqrt(gx*gx+gy*gy);
-        GangV[y*size+x]=Math.atan2(gy,gx);
-      }
+    const zvv=[]; for(let i=0;i<size*size;i++) if(zV[i]) zvv.push(gV[i]);
+    zvv.sort((a,b)=>a-b);
+    const p95v=zvv.length?zvv[Math.floor(zvv.length*0.95)]:255;
+    const zmv=zvv.length?zvv.reduce((s,v)=>s+v,0)/zvv.length:128;
+    const specV=new Uint8Array(size*size);
+    const mV=new Float32Array(gV);
+    for(let i=0;i<size*size;i++) if(zV[i]&&mV[i]>p95v){mV[i]=zmv;specV[i]=1;}
+    // Blur + Sobel + NMS + Hysteresis (mirror measurePupil)
+    const bV=new Float32Array(size*size); gaussianBlur5(mV,bV,size,size,zV);
+    const GmV=new Float32Array(size*size),GaV=new Float32Array(size*size);
+    for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+      if(!zV[y*size+x]) continue;
+      const p=(dy,dx)=>zV[(y+dy)*size+(x+dx)]?bV[(y+dy)*size+(x+dx)]:bV[y*size+x];
+      const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
+      const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
+      GmV[y*size+x]=Math.sqrt(gx*gx+gy*gy); GaV[y*size+x]=Math.atan2(gy,gx);
     }
-    // NMS + direction filter + hysteresis
     const nmsV=new Uint8Array(size*size);
-    for(let y=1;y<size-1;y++){
-      for(let x=1;x<size-1;x++){
-        if(!zoneV2[y*size+x]||GmagV[y*size+x]===0) continue;
-        const deg=((GangV[y*size+x]*180/Math.PI)%180+180)%180;
-        let nx1,ny1,nx2,ny2;
-        if(deg<22.5||deg>=157.5){nx1=1;ny1=0;nx2=-1;ny2=0;}
-        else if(deg<67.5){nx1=1;ny1=1;nx2=-1;ny2=-1;}
-        else if(deg<112.5){nx1=0;ny1=1;nx2=0;ny2=-1;}
-        else{nx1=-1;ny1=1;nx2=1;ny2=-1;}
-        const m=GmagV[y*size+x];
-        const m1=zoneV2[(y+ny1)*size+(x+nx1)]?GmagV[(y+ny1)*size+(x+nx1)]:0;
-        const m2=zoneV2[(y+ny2)*size+(x+nx2)]?GmagV[(y+ny2)*size+(x+nx2)]:0;
-        if(m>=m1&&m>=m2){
-          const rx=x-cx2v,ry=y-cy2v;
-          const gdx=Math.cos(GangV[y*size+x]),gdy=Math.sin(GangV[y*size+x]);
-          if(rx*gdx+ry*gdy>0) nmsV[y*size+x]=1;
-        }
-      }
+    for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+      if(!zV[y*size+x]||!GmV[y*size+x]) continue;
+      const deg=((GaV[y*size+x]*180/Math.PI)%180+180)%180;
+      let nx1,ny1,nx2,ny2;
+      if(deg<22.5||deg>=157.5){nx1=1;ny1=0;nx2=-1;ny2=0;}
+      else if(deg<67.5){nx1=1;ny1=1;nx2=-1;ny2=-1;}
+      else if(deg<112.5){nx1=0;ny1=1;nx2=0;ny2=-1;}
+      else{nx1=-1;ny1=1;nx2=1;ny2=-1;}
+      const mv=GmV[y*size+x];
+      const m1=zV[(y+ny1)*size+(x+nx1)]?GmV[(y+ny1)*size+(x+nx1)]:0;
+      const m2=zV[(y+ny2)*size+(x+nx2)]?GmV[(y+ny2)*size+(x+nx2)]:0;
+      if(mv>=m1&&mv>=m2) nmsV[y*size+x]=1;
     }
-    let maxGV=0;
-    for(let i=0;i<size*size;i++) if(nmsV[i]) maxGV=Math.max(maxGV,GmagV[i]);
-    const hiTV=maxGV*0.35,loTV=maxGV*0.15;
-    const strongV=new Uint8Array(size*size),weakV=new Uint8Array(size*size);
+    let mxGV=0; for(let i=0;i<size*size;i++) if(nmsV[i]) mxGV=Math.max(mxGV,GmV[i]);
+    const hiTV=mxGV*0.30,loTV=mxGV*0.10;
+    const strV=new Uint8Array(size*size),wkV=new Uint8Array(size*size);
     for(let i=0;i<size*size;i++){
       if(!nmsV[i]) continue;
-      if(GmagV[i]>=hiTV) strongV[i]=1; else if(GmagV[i]>=loTV) weakV[i]=1;
+      if(GmV[i]>=hiTV) strV[i]=1; else if(GmV[i]>=loTV) wkV[i]=1;
     }
     for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
-      if(!weakV[y*size+x]) continue;
-      let hs=false;
-      for(let dy=-1;dy<=1&&!hs;dy++) for(let dx=-1;dx<=1;dx++) if(strongV[(y+dy)*size+(x+dx)]) hs=true;
-      if(hs) strongV[y*size+x]=1;
+      if(!wkV[y*size+x]) continue;
+      let ok=false;
+      for(let dy=-1;dy<=1&&!ok;dy++) for(let dx=-1;dx<=1;dx++) if(strV[(y+dy)*size+(x+dx)]) ok=true;
+      if(ok) strV[y*size+x]=1;
     }
-
-    // Render: dark background, iris gray, edge pixels bright yellow, specular cyan
-    const maskdV=tc.createImageData(size,size); const mdV=maskdV.data;
-    for(let y=0;y<size;y++){
-      for(let x=0;x<size;x++){
-        const idx=y*size+x; const i=idx*4;
-        if(!zoneV2[idx]){
-          mdV[i]=15;mdV[i+1]=15;mdV[i+2]=22;mdV[i+3]=255;
-        } else if(grayV2[idx]>p95v){
-          // specular: cyan
-          mdV[i]=0;mdV[i+1]=220;mdV[i+2]=255;mdV[i+3]=255;
-        } else if(strongV[idx]){
-          // pupil boundary edge: bright yellow
-          mdV[i]=255;mdV[i+1]=255;mdV[i+2]=0;mdV[i+3]=255;
-        } else {
-          // iris background: dimmed gray
-          const v=Math.round(blurV2[idx]*0.5);
-          mdV[i]=v;mdV[i+1]=v;mdV[i+2]=v;mdV[i+3]=255;
+    // Thinning
+    for(let y=2;y<size-2;y++) for(let x=2;x<size-2;x++){
+      if(!strV[y*size+x]) continue;
+      let neig=0;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) if(strV[(y+dy)*size+(x+dx)]) neig++;
+      if(neig>4){strV[y*size+x]=0;continue;}
+      const n=strV[(y-1)*size+x],s=strV[(y+1)*size+x],e=strV[y*size+(x+1)],w=strV[y*size+(x-1)];
+      if((e&&s)||(e&&n)||(w&&s)||(w&&n)) strV[y*size+x]=0;
+    }
+    // Connected components
+    const lblV=new Int16Array(size*size); let nlV=0;
+    const csV=[],sxV=[],syV=[];
+    for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+      if(!strV[y*size+x]||lblV[y*size+x]) continue;
+      nlV++; const lbl=nlV;
+      const stk=[y*size+x]; lblV[y*size+x]=lbl;
+      let cnt=0,sx=0,sy=0;
+      while(stk.length){
+        const idx=stk.pop(); const px=idx%size,py=(idx-px)/size;
+        cnt++;sx+=px;sy+=py;
+        for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+          const ny=py+dy,nx=px+dx;
+          if(ny<0||ny>=size||nx<0||nx>=size) continue;
+          const ni=ny*size+nx;
+          if(strV[ni]&&!lblV[ni]){lblV[ni]=lbl;stk.push(ni);}
         }
       }
+      csV.push(cnt);sxV.push(sx);syV.push(sy);
     }
-    tc.putImageData(maskdV,0,0);
-    // Outer ring + lid lines
+    // Photometric inner<outer check
+    const imrV=outerRV*0.5,imr2V=imrV*imrV;
+    let iSm=0,iCn=0,oSm=0,oCn=0;
+    for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+      if(!zV[y*size+x]) continue;
+      const dx=x-cx2v,dy=y-cy2v,r2=dx*dx+dy*dy;
+      if(r2<imr2V){iSm+=bV[y*size+x];iCn++;}else if(r2<=outerR2V){oSm+=bV[y*size+x];oCn++;}
+    }
+    const iDarker=(iCn&&oCn)?(iSm/iCn<oSm/oCn-5):false;
+    // Good-label map
+    const glV=new Uint8Array(nlV+1);
+    for(let l=1;l<=nlV;l++){
+      if(csV[l-1]<10) continue;
+      const mx2=sxV[l-1]/csV[l-1],my2=syV[l-1]/csV[l-1];
+      if(Math.sqrt((mx2-cx2v)**2+(my2-cy2v)**2)>irisRad*0.4) continue;
+      if(!iDarker) continue;
+      glV[l]=1;
+    }
+    const geV=new Uint8Array(size*size);
+    for(let i=0;i<size*size;i++) if(lblV[i]&&glV[lblV[i]]) geV[i]=1;
+
+    // Starburst hits
+    const hxV=[],hyV=[];
+    for(let r=0;r<STARBURST_RAYS;r++){
+      const ang=r*2*Math.PI/STARBURST_RAYS;
+      const cos=Math.cos(ang),sin=Math.sin(ang);
+      for(let t=innerRV;t<=outerRV;t+=0.7){
+        const px=Math.round(cx2v+cos*t),py=Math.round(cy2v+sin*t);
+        if(px<0||px>=size||py<0||py>=size) break;
+        if(geV[py*size+px]){hxV.push(px);hyV.push(py);break;}
+      }
+    }
+    // Taubin fit
+    const tcRes=hxV.length>=5?taubinCircle(hxV,hyV):null;
+
+    // Render pixel map
+    const mdV=tc.createImageData(size,size); const mdVd=mdV.data;
+    for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+      const idx=y*size+x; const i=idx*4;
+      if(!zV[idx]){
+        mdVd[i]=10;mdVd[i+1]=10;mdVd[i+2]=16;mdVd[i+3]=255;
+      } else if(specV[idx]){
+        mdVd[i]=0;mdVd[i+1]=180;mdVd[i+2]=200;mdVd[i+3]=255;   // cyan=specular
+      } else if(geV[idx]){
+        mdVd[i]=60;mdVd[i+1]=255;mdVd[i+2]=120;mdVd[i+3]=255;  // green=good contour
+      } else if(strV[idx]&&lblV[idx]&&!glV[lblV[idx]]){
+        mdVd[i]=200;mdVd[i+1]=40;mdVd[i+2]=40;mdVd[i+3]=255;   // red=rejected contour
+      } else if(strV[idx]){
+        mdVd[i]=80;mdVd[i+1]=80;mdVd[i+2]=0;mdVd[i+3]=255;     // dim yellow=thinned edge
+      } else {
+        const v=Math.round(bV[idx]*0.35);
+        mdVd[i]=v;mdVd[i+1]=v;mdVd[i+2]=v;mdVd[i+3]=255;       // dim iris
+      }
+    }
+    tc.putImageData(mdV,0,0);
+
+    // Starburst hits: yellow dots
+    hxV.forEach((hx,hi)=>{
+      tc.fillStyle='rgba(255,230,0,.9)';
+      tc.fillRect(hxV[hi]-1,hyV[hi]-1,3,3);
+    });
+
+    // Fitted circle (cyan)
+    if(tcRes){
+      tc.beginPath();tc.arc(tcRes.cx,tcRes.cy,tcRes.r,0,Math.PI*2);
+      tc.strokeStyle='rgba(0,255,220,.9)';tc.lineWidth=1.5;tc.stroke();
+    }
+
+    // Outer zone ring + lid lines
     tc.beginPath();tc.arc(cx2v,cy2v,outerRV,0,Math.PI*2);
-    tc.strokeStyle='rgba(255,255,255,.25)';tc.lineWidth=1;tc.stroke();
+    tc.strokeStyle='rgba(255,255,255,.2)';tc.lineWidth=1;tc.stroke();
     if(upperLidY!=null){
-      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.5)';tc.lineWidth=1;
+      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.4)';tc.lineWidth=1;
       tc.beginPath();tc.moveTo(0,lidTopV);tc.lineTo(size,lidTopV);tc.stroke();
     }
     if(lowerLidY!=null){
-      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.5)';tc.lineWidth=1;
+      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.4)';tc.lineWidth=1;
       tc.beginPath();tc.moveTo(0,lidBotV);tc.lineTo(size,lidBotV);tc.stroke();
     }
     tc.setLineDash([]);
     _valCtx.drawImage(tmp,0,0,size,size, col*CELL,PAD+CELL,CELL,CELL);
 
-    // Iris + pupil circles on mask row
+    // Iris ring on mask row overlay
     _valCtx.beginPath();
-    _valCtx.arc(col*CELL+CELL/2, PAD+CELL+CELL/2, CELL/2-1, 0, Math.PI*2);
-    _valCtx.strokeStyle='rgba(255,255,255,.2)'; _valCtx.lineWidth=1; _valCtx.stroke();
-    if(pupilPx != null && pupilPx > 0){
-      _valCtx.beginPath();
-      _valCtx.arc(col*CELL+CELL/2, PAD+CELL+CELL/2, pupilPx*sc, 0, Math.PI*2);
-      _valCtx.strokeStyle='rgba(0,255,220,.7)'; _valCtx.lineWidth=1.5; _valCtx.stroke();
-    }
+    _valCtx.arc(col*CELL+CELL/2,PAD+CELL+CELL/2,CELL/2-1,0,Math.PI*2);
+    _valCtx.strokeStyle='rgba(255,255,255,.15)';_valCtx.lineWidth=1;_valCtx.stroke();
 
     // Eye label
     _valCtx.fillStyle = col===0 ? '#7b8fff' : '#ff6b9d';
     _valCtx.font = '9px Space Mono,monospace';
     _valCtx.fillText(eye.tag, col*CELL+3, PAD-4);
-  });
 
   // ── Label bar ─────────────────────────────────────────────────────────────
   const sign = dtFlash!=null ? (dtFlash>=0?'+':'') : '';
@@ -1319,7 +1389,9 @@ function captureValidationFrame(m, elapsed_ms){
   const rPx = m.rPupilPx!=null ? m.rPupilPx.toFixed(1)+'px' : 'null';
   const lMm = m.lPupilMm!=null ? '/'+m.lPupilMm.toFixed(2)+'mm' : '';
   const rMm = m.rPupilMm!=null ? '/'+m.rPupilMm.toFixed(2)+'mm' : '';
-  const label = `${windowLabel}${dtStr} t=${elapsed_ms}ms  L:${lPx}${lMm} R:${rPx}${rMm}`;
+  const lCf = m.lPupilConf!=null ? ' c'+m.lPupilConf.toFixed(2) : '';
+  const rCf = m.rPupilConf!=null ? ' c'+m.rPupilConf.toFixed(2) : '';
+  const label = `${windowLabel}${dtStr} t=${elapsed_ms}ms  L:${lPx}${lMm}${lCf} R:${rPx}${rMm}${rCf}`;
   _valCtx.fillStyle = inFlashWindow ? 'rgba(255,183,71,.9)' : 'rgba(74,240,200,.85)';
   _valCtx.font = 'bold 9px Space Mono,monospace';
   _valCtx.fillText(label, 2, 11);
@@ -1424,6 +1496,7 @@ function updateUI(m){
       lIrisMm:m.lIrisMm,rIrisMm:m.rIrisMm,
       tilt:m.tiltR,q:m.quality,
       flashColor:S.currentFlashColor||'',
+      lConf:m.lPupilConf, rConf:m.rPupilConf,
     });
     // Validation frame capture (flash-window eye images)
     captureValidationFrame(m, S.trialStartMs ? now - S.trialStartMs : 0);
@@ -2049,7 +2122,7 @@ $('exportBtn').onclick=()=>{
   // We reconstruct from the phase label in data
 
   const meta=[
-    '# PupilLens v5 Export',
+    '# PupilLens v6 Export',
     `# Date: ${new Date().toISOString()}`,
     `# Trial type: ${trialType}`,
     `# Trial start (unix ms): ${S.trialStartMs||'?'}`,
@@ -2070,12 +2143,13 @@ $('exportBtn').onclick=()=>{
     `# CIELAB: intensity slider = L* value, converted via IEC 61966-2-1 sRGB gamma`,
     `# Column notes:`,
     `#   left/right_pupil_px_smooth : EMA-smoothed pupil radius in video pixels (main signal for waveform/PLR)`,
-    `#   left/right_pupil_px_raw    : per-frame raw pupil radius from pixel thresholding`,
+    `#   left/right_pupil_px_raw    : per-frame raw pupil radius from v6 starburst→Taubin pipeline`,
     `#   left/right_pupil_mm        : pupil diameter in mm (pupil_px_raw × 2 × mm/px scale)`,
     `#   left/right_iris_radius_px  : iris outer boundary radius in px — used as mm/px ruler`,
     `#   left/right_iris_mm         : iris diameter in mm (sanity check — L=${parseFloat($('irisL')?.value)||11.7}mm, R=${parseFloat($('irisR')?.value)||11.7}mm assumed)`,
+    `#   left/right_pupil_confidence: PuRe outline contrast score 0–1 (fraction of radial samples with inner<outer brightness)`,
     '#',
-    't_ms,elapsed_ms,segment,rep,trial_type,flash_color,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality',
+    't_ms,elapsed_ms,segment,rep,trial_type,flash_color,flash_intensity_Lstar,flash_duration_ms,adapt_dur_s,baseline_dur_s,recovery_dur_s,left_pupil_px_smooth,right_pupil_px_smooth,left_pupil_px_raw,right_pupil_px_raw,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality,left_pupil_confidence,right_pupil_confidence',
   ];
 
   const rows=S.trialData.map(d=>[
@@ -2104,6 +2178,8 @@ $('exportBtn').onclick=()=>{
     d.rIrisMm?.toFixed(3)||'',
     d.tilt.toFixed(3),
     d.q,
+    d.lConf!=null?d.lConf.toFixed(3):'',
+    d.rConf!=null?d.rConf.toFixed(3):'',
   ].join(','));
 
   const csv=[...meta,...rows].join('\n');
@@ -2111,7 +2187,7 @@ $('exportBtn').onclick=()=>{
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
   a.href=url;
-  a.download=`pupillens_v3_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
+  a.download=`pupillens_v6_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

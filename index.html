@@ -10,7 +10,7 @@
 <link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="manifest" href="manifest.json">
-<title>PupilLens v4</title>
+<title>PupilLens v5</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -173,7 +173,7 @@ table.res td.bad{color:var(--accent3)}
 <div id="app">
   <header>
     <div class="logo">Pupil<span>Lens</span></div>
-    <span class="v3badge">v4</span>
+    <span class="v3badge">v5</span>
     <div style="font-family:var(--mono);font-size:11px;color:var(--dim)">PLR Protocol</div>
     <div class="pill"><div class="dot" id="dot"></div><span id="stxt">IDLE</span></div>
   </header>
@@ -191,7 +191,7 @@ table.res td.bad{color:var(--accent3)}
 
     <div id="splash">
       <div class="eye-icon">👁</div>
-      <h2>PupilLens v4</h2>
+      <h2>PupilLens v5</h2>
       <p>Iris tracking + PLR protocol. Tracks % change in pupil size — the real signal.</p>
       <button class="btn-start" id="startBtn">Start Camera</button>
       <div class="hint">· Dim room for best results<br>· 35–50 cm from screen<br>· Look straight at camera</div>
@@ -557,135 +557,329 @@ function measureIrisDiam(kps, ci, upperLidIdx, lowerLidIdx){
   return { diam, horizDiam, vertDiam, horizRad, topOk, botOk };
 }
 
-// ── Pupil measurement v4 ─────────────────────────────────────────────────
-// Pipeline:
-//   1. Crop iris region from video frame
-//   2. Grayscale (Rec.709)
-//   3. Annular working zone:
-//        r < innerRad (1 mm)  → [commented out — inner disk forced dark]
-//        r > outerRad (4 mm)  → excluded (only iris/limbus beyond here)
-//        ring between the two → blur + normalize + threshold
-//   4. Lid exclusion: zone-2 pixels above upperLidY or below lowerLidY
-//        (with LID_BUF margin) are excluded — kills lid/lash dark regions
-//   5. 3×3 box blur on ring pixels only
-//   6. Trimmed-mean normalization: compute mean of bottom 90% of ring values,
-//        scale so mean→128, apply fixed threshold at 70 (≈0.55×128)
-//   7. Second-order central moments → best-fit circle radius
-//   8. Centroid gate: blob centroid within 25% of irisRad from center
-//   9. Hard clamp: [1 mm, 4 mm] anatomical bounds
+// ── Pupil measurement v5 — ExCuSe-style edge-based ellipse fit ───────────
 //
-// upperLidY / lowerLidY are in VIDEO pixel space (from MediaPipe landmarks).
+// Pipeline (inspired by Świrski 2012 / ExCuSe / PuRe):
+//   1.  Crop iris region, grayscale (Rec.709)
+//   2.  Lid exclusion + 4mm radial clamp (same as v4)
+//   3.  Specular reflection mask: pixels above 95th-percentile → replaced
+//       with local mean so they contribute no edge signal
+//   4.  5×5 separable Gaussian blur (σ≈1.0) for noise suppression
+//   5.  Sobel gradient: magnitude G and angle θ at every zone pixel
+//   6.  Non-maximum suppression: thin to 1-px-wide ridges
+//   7.  Edge direction filter: keep only edges whose gradient points
+//       OUTWARD from the iris center (dark-inside → bright-outside = pupil
+//       boundary). This is the key step that survives flash — the boundary
+//       edge exists even when the pupil interior is blown out.
+//   8.  Double-threshold hysteresis (Canny): strong=0.35×max, weak=0.15×max
+//   9.  Fitzgibbon direct least-squares ellipse fit to surviving edge pixels
+//  10.  Validate: center near iris landmark, axes in [1mm,4mm], aspect≥0.5
+//  11.  Return mean semi-axis as pupil radius
+//
+// All in pure JS, zero dependencies.
 
-const LID_BUF = 3; // px margin inside lid landmarks before excluding
+const LID_BUF = 4;
 
-const _pupilCanvas=document.createElement('canvas');
-const _pupilCtx=_pupilCanvas.getContext('2d',{willReadFrequently:true});
+const _pupilCanvas = document.createElement('canvas');
+const _pupilCtx    = _pupilCanvas.getContext('2d', {willReadFrequently:true});
+
+// ── 5×5 separable Gaussian [1,4,6,4,1]/16 ───────────────────────────────
+function gaussianBlur5(src, dst, w, h, mask){
+  const K=[1,4,6,4,1], KS=16;
+  const tmp=new Float32Array(w*h);
+  // horizontal pass
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      if(!mask[y*w+x]){continue;}
+      let s=0,n=0;
+      for(let k=-2;k<=2;k++){
+        const nx=x+k;
+        if(nx<0||nx>=w||!mask[y*w+nx]) continue;
+        s+=src[y*w+nx]*K[k+2]; n+=K[k+2];
+      }
+      tmp[y*w+x]=n?s/n:src[y*w+x];
+    }
+  }
+  // vertical pass
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      if(!mask[y*w+x]){dst[y*w+x]=0;continue;}
+      let s=0,n=0;
+      for(let k=-2;k<=2;k++){
+        const ny=y+k;
+        if(ny<0||ny>=h||!mask[ny*w+x]) continue;
+        s+=tmp[ny*w+x]*K[k+2]; n+=K[k+2];
+      }
+      dst[y*w+x]=n?s/n:tmp[y*w+x];
+    }
+  }
+}
+
+// ── Fitzgibbon direct ellipse fit ────────────────────────────────────────
+// Fits ax²+bxy+cy²+dx+ey+f=0 with constraint 4ac-b²=1 (ellipse-specific).
+// Input: arrays of x,y coords. Returns {cx,cy,a,b} (center + semi-axes) or null.
+function fitEllipse(xs, ys){
+  const n=xs.length;
+  if(n<6) return null;
+
+  // Design matrix D (n×6): [x², xy, y², x, y, 1]
+  const D=[];
+  for(let i=0;i<n;i++){
+    const x=xs[i],y=ys[i];
+    D.push([x*x, x*y, y*y, x, y, 1]);
+  }
+
+  // Scatter matrix S = Dᵀ D  (6×6)
+  const S=Array.from({length:6},()=>new Float64Array(6));
+  for(let i=0;i<n;i++){
+    for(let r=0;r<6;r++) for(let c=0;c<6;c++) S[r][c]+=D[i][r]*D[i][c];
+  }
+
+  // Constraint matrix C for ellipse: C[0][2]=C[2][0]=2, C[1][1]=-1
+  const C=Array.from({length:6},()=>new Float64Array(6));
+  C[0][2]=2; C[2][0]=2; C[1][1]=-1;
+
+  // Solve generalised eigensystem S·a = λ·C·a
+  // We use the algebraic reduction from Fitzgibbon 1999:
+  // partition S into S11(3×3 top-left), S12, S21, S22
+  // then solve reduced 3×3 system M = S22⁻¹·S21·S11⁻¹·S12 ... 
+  // For robustness we use a simple power-iteration on (S⁻¹C) restricted
+  // to the ellipse subspace — but full Fitzgibbon needs a real eigensolver.
+  // We implement the compact version via LU decomposition of the 6×6 system.
+
+  // LU decompose S in-place, then solve for each of 6 unit vectors → S⁻¹
+  const Lu=S.map(r=>[...r]);
+  const piv=Array.from({length:6},(_,i)=>i);
+  for(let k=0;k<6;k++){
+    // partial pivot
+    let maxV=Math.abs(Lu[k][k]),maxR=k;
+    for(let i=k+1;i<6;i++) if(Math.abs(Lu[i][k])>maxV){maxV=Math.abs(Lu[i][k]);maxR=i;}
+    [Lu[k],Lu[maxR]]=[Lu[maxR],Lu[k]];[piv[k],piv[maxR]]=[piv[maxR],piv[k]];
+    if(Math.abs(Lu[k][k])<1e-12) return null; // singular
+    for(let i=k+1;i<6;i++){
+      Lu[i][k]/=Lu[k][k];
+      for(let j=k+1;j<6;j++) Lu[i][j]-=Lu[i][k]*Lu[k][j];
+    }
+  }
+  const luSolve=b=>{
+    const x=[...b];
+    // forward sub
+    for(let i=0;i<6;i++) for(let j=0;j<i;j++) x[i]-=Lu[i][j]*x[j];
+    // back sub
+    for(let i=5;i>=0;i--){
+      for(let j=i+1;j<6;j++) x[i]-=Lu[i][j]*x[j];
+      x[i]/=Lu[i][i];
+    }
+    return x;
+  };
+
+  // Compute S⁻¹ (6×6)
+  const Sinv=Array.from({length:6},(_,c)=>{
+    const e=new Array(6).fill(0); e[piv[c]]=1;
+    // un-pivot: solve with original pivot ordering
+    const ep=new Array(6).fill(0);
+    for(let i=0;i<6;i++) ep[i]=e[piv.indexOf(i)];
+    return luSolve(ep);
+  });
+
+  // M = S⁻¹ · C  (6×6)
+  const M=Array.from({length:6},()=>new Float64Array(6));
+  for(let r=0;r<6;r++) for(let c=0;c<6;c++)
+    for(let k=0;k<6;k++) M[r][c]+=Sinv[r][k]*C[k][c];
+
+  // Power iteration to find eigenvector with largest positive eigenvalue
+  // (the ellipse solution has exactly one positive eigenvalue)
+  let vec=new Float64Array([1,1,1,1,1,1]);
+  for(let iter=0;iter<80;iter++){
+    const nv=new Float64Array(6);
+    for(let r=0;r<6;r++) for(let c=0;c<6;c++) nv[r]+=M[r][c]*vec[c];
+    const norm=Math.sqrt(nv.reduce((s,v)=>s+v*v,0));
+    if(norm<1e-14) return null;
+    for(let i=0;i<6;i++) vec[i]=nv[i]/norm;
+  }
+  // eigenvalue sign check — we want the positive one
+  const Mv=new Float64Array(6);
+  for(let r=0;r<6;r++) for(let c=0;c<6;c++) Mv[r]+=M[r][c]*vec[c];
+  const lam=Mv.reduce((s,v,i)=>s+v*vec[i],0);
+  if(lam<0){
+    // try inverse iteration for the other sign
+    for(let i=0;i<6;i++) vec[i]=-vec[i];
+  }
+
+  // vec = [a,b,c,d,e,f] coefficients of ax²+bxy+cy²+dx+ey+f=0
+  const [a,b,c,d,e,f]=vec;
+
+  // Check it's an ellipse: b²-4ac < 0
+  if(b*b-4*a*c>=0) return null;
+
+  // Convert to geometric form (center, axes, angle)
+  const denom=b*b-4*a*c;
+  const ecx=(2*c*d-b*e)/denom;
+  const ecy=(2*a*e-b*d)/denom;
+
+  const num=2*(a*e*e+c*d*d-b*d*e+(b*b-4*a*c)*f);
+  const sq=Math.sqrt((a-c)**2+b*b);
+  const axis1=Math.abs(num/(denom*(sq-(a+c))));
+  const axis2=Math.abs(num/(denom*(-sq-(a+c))));
+  if(!isFinite(axis1)||!isFinite(axis2)||axis1<=0||axis2<=0) return null;
+
+  const semiA=Math.sqrt(axis1);
+  const semiB=Math.sqrt(axis2);
+
+  return {cx:ecx, cy:ecy, semiA, semiB};
+}
 
 function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
-  if(!vid||!vid.videoWidth||irisRad<4)return null;
+  if(!vid||!vid.videoWidth||irisRad<4) return null;
 
   const vw=vid.videoWidth, vh=vid.videoHeight;
   const size=Math.round(irisRad*2)*2;
   const half=size/2;
   const srcX=Math.round(cx-half), srcY=Math.round(cy-half);
-  if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh)return null;
+  if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh) return null;
 
-  _pupilCanvas.width=size;
-  _pupilCanvas.height=size;
+  _pupilCanvas.width=size; _pupilCanvas.height=size;
   _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
   const {data}=_pupilCtx.getImageData(0,0,size,size);
 
-  // ── Anatomical radius limits ──────────────────────────────────────────────
-  const mmToPx  = irisRad / 5.85;
-  // const innerR  = 1.0 * mmToPx;  // [v4 inner disk — commented out, off-center artifact]
-  // const innerR2 = innerR * innerR;
-  const outerR  = 4.0 * mmToPx;
-  const outerR2 = outerR * outerR;
+  const mmToPx = irisRad/5.85;
+  const outerR  = 4.0*mmToPx, outerR2=outerR*outerR;
+  const innerR  = 1.0*mmToPx;
   const cx2=half, cy2=half;
+  const lidTopY = upperLidY!=null ? (upperLidY-srcY)+LID_BUF : -1;
+  const lidBotY = lowerLidY!=null ? (lowerLidY-srcY)-LID_BUF : size+1;
 
-  // Lid Y coords converted to crop-local space
-  const lidTopY    = upperLidY != null ? (upperLidY - srcY) + LID_BUF  : -1;
-  const lidBotY    = lowerLidY != null ? (lowerLidY - srcY) - LID_BUF  : size+1;
-
-  // ── Pass 1: grayscale + zone classification ──────────────────────────────
-  const gray = new Float32Array(size*size);
-  const zone = new Uint8Array(size*size);  // 0=outside, 2=ring (no zone 1 now)
+  // ── Pass 1: grayscale + zone mask ────────────────────────────────────────
+  const gray=new Float32Array(size*size);
+  const zone=new Uint8Array(size*size);
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
-      const dx=x-cx2, dy=y-cy2;
-      const r2=dx*dx+dy*dy;
-      if(r2>outerR2) continue;
-      // Lid exclusion: skip pixels outside the open-eye band
-      if(y < lidTopY || y > lidBotY) continue;
+      const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
+      if(r2>outerR2||y<lidTopY||y>lidBotY) continue;
       const i=(y*size+x)*4;
       gray[y*size+x]=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722;
-      zone[y*size+x]=2;
+      zone[y*size+x]=1;
     }
   }
 
-  // ── Pass 2: 3×3 box blur on zone-2 pixels ────────────────────────────────
-  const blurred = new Float32Array(size*size);
+  // ── Pass 2: specular reflection mask (top 5% brightness → local mean) ────
+  const zoneVals=[];
+  for(let i=0;i<size*size;i++) if(zone[i]) zoneVals.push(gray[i]);
+  if(zoneVals.length<20) return null;
+  zoneVals.sort((a,b)=>a-b);
+  const p95=zoneVals[Math.floor(zoneVals.length*0.95)];
+  const zoneMean=zoneVals.reduce((s,v)=>s+v,0)/zoneVals.length;
+  const masked=new Float32Array(gray);
+  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zoneMean;
+
+  // ── Pass 3: 5×5 Gaussian blur ────────────────────────────────────────────
+  const blurred=new Float32Array(size*size);
+  gaussianBlur5(masked, blurred, size, size, zone);
+
+  // ── Pass 4: Sobel gradient ───────────────────────────────────────────────
+  const Gmag=new Float32Array(size*size);
+  const Gang=new Float32Array(size*size);
+  for(let y=1;y<size-1;y++){
+    for(let x=1;x<size-1;x++){
+      if(!zone[y*size+x]) continue;
+      const p=(dy,dx)=>zone[(y+dy)*size+(x+dx)]?blurred[(y+dy)*size+(x+dx)]:blurred[y*size+x];
+      const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
+      const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
+      Gmag[y*size+x]=Math.sqrt(gx*gx+gy*gy);
+      Gang[y*size+x]=Math.atan2(gy,gx);
+    }
+  }
+
+  // ── Pass 5: non-maximum suppression ─────────────────────────────────────
+  const nms=new Uint8Array(size*size);
+  for(let y=1;y<size-1;y++){
+    for(let x=1;x<size-1;x++){
+      if(!zone[y*size+x]||Gmag[y*size+x]===0) continue;
+      const ang=Gang[y*size+x];
+      // quantise gradient direction to 4 bins (0°,45°,90°,135°)
+      const deg=((ang*180/Math.PI)%180+180)%180;
+      let nx1,ny1,nx2,ny2;
+      if(deg<22.5||deg>=157.5){        nx1=1;ny1=0;nx2=-1;ny2=0;}
+      else if(deg<67.5) {              nx1=1;ny1=1;nx2=-1;ny2=-1;}
+      else if(deg<112.5){              nx1=0;ny1=1;nx2=0; ny2=-1;}
+      else{                            nx1=-1;ny1=1;nx2=1;ny2=-1;}
+      const m=Gmag[y*size+x];
+      const m1=zone[(y+ny1)*size+(x+nx1)]?Gmag[(y+ny1)*size+(x+nx1)]:0;
+      const m2=zone[(y+ny2)*size+(x+nx2)]?Gmag[(y+ny2)*size+(x+nx2)]:0;
+      if(m>=m1&&m>=m2) nms[y*size+x]=1;
+    }
+  }
+
+  // ── Pass 6: edge direction filter — outward-pointing only ────────────────
+  // Pupil boundary: inside is darker than outside → gradient points outward
+  // from iris center. Keep edge pixels where dot(gradient, radialOut) > 0.
+  const edgeDir=new Uint8Array(size*size);
   for(let y=0;y<size;y++){
     for(let x=0;x<size;x++){
-      if(zone[y*size+x]!==2) continue;
-      let s=0, n=0;
-      for(let dy=-1;dy<=1;dy++){
-        for(let dx=-1;dx<=1;dx++){
-          const ny=y+dy, nx=x+dx;
-          if(ny<0||ny>=size||nx<0||nx>=size) continue;
-          if(zone[ny*size+nx]===0) continue;
-          s+=gray[ny*size+nx]; n++;
-        }
-      }
-      blurred[y*size+x] = n>0 ? s/n : gray[y*size+x];
+      if(!nms[y*size+x]) continue;
+      const rx=x-cx2, ry=y-cy2;   // radial outward vector
+      const ang=Gang[y*size+x];
+      const gdx=Math.cos(ang), gdy=Math.sin(ang);
+      // dot product — keep if gradient has outward component
+      if(rx*gdx+ry*gdy > 0) edgeDir[y*size+x]=1;
     }
   }
 
-  // ── Pass 3: trimmed-mean normalization + fixed threshold ──────────────────
-  const ringVals = [];
+  // ── Pass 7: double-threshold hysteresis ──────────────────────────────────
+  let maxG=0;
+  for(let i=0;i<size*size;i++) if(edgeDir[i]) maxG=Math.max(maxG,Gmag[i]);
+  if(maxG<1) return null;
+  const hiT=maxG*0.35, loT=maxG*0.15;
+
+  const strong=new Uint8Array(size*size);
+  const weak  =new Uint8Array(size*size);
   for(let i=0;i<size*size;i++){
-    if(zone[i]===2) ringVals.push(blurred[i]);
+    if(!edgeDir[i]) continue;
+    if(Gmag[i]>=hiT) strong[i]=1;
+    else if(Gmag[i]>=loT) weak[i]=1;
   }
-  if(ringVals.length<16) return null;
-  ringVals.sort((a,b)=>a-b);
-  const trimN = Math.floor(ringVals.length*0.90);
-  let trimSum=0;
-  for(let i=0;i<trimN;i++) trimSum+=ringVals[i];
-  const trimMean = trimSum/trimN;
-  if(trimMean<1) return null;
-  const scale = 128/trimMean;
-  const THRESH = 70;
-
-  // ── Pass 4: moments on dark mask ─────────────────────────────────────────
-  let m00=0, m10=0, m01=0, m20=0, m02=0;
-  for(let y=0;y<size;y++){
-    for(let x=0;x<size;x++){
-      const idx=y*size+x;
-      if(zone[idx]!==2) continue;
-      if(blurred[idx]*scale > THRESH) continue;
-      m00++; m10+=x; m01+=y; m20+=x*x; m02+=y*y;
+  // connect weak edges to strong (single-pass 8-connected)
+  for(let y=1;y<size-1;y++){
+    for(let x=1;x<size-1;x++){
+      if(!weak[y*size+x]) continue;
+      let hasStrong=false;
+      for(let dy=-1;dy<=1&&!hasStrong;dy++)
+        for(let dx=-1;dx<=1;dx++)
+          if(strong[(y+dy)*size+(x+dx)]) hasStrong=true;
+      if(hasStrong) strong[y*size+x]=1;
     }
   }
-  if(m00<4) return null;
 
-  // ── Pass 5: centroid gate ─────────────────────────────────────────────────
-  const centX=m10/m00, centY=m01/m00;
-  const centDist=Math.sqrt((centX-cx2)**2+(centY-cy2)**2);
-  if(centDist > irisRad*0.25) return null;
+  // ── Pass 8: collect edge pixels ──────────────────────────────────────────
+  const ex=[],ey=[];
+  for(let y=0;y<size;y++)
+    for(let x=0;x<size;x++)
+      if(strong[y*size+x]){ex.push(x);ey.push(y);}
 
-  // ── Pass 6: second-order central moments → radius ────────────────────────
-  const mu20=m20/m00-centX*centX;
-  const mu02=m02/m00-centY*centY;
-  const sigma2=(mu20+mu02)/2;
-  if(sigma2<=0) return null;
-  const pupilRad=2*Math.sqrt(sigma2);
+  if(ex.length<8) return null;
 
-  // ── Hard clamp ────────────────────────────────────────────────────────────
-  const innerR = 1.0 * mmToPx;
-  if(pupilRad<innerR||pupilRad>outerR) return null;
+  // ── Pass 9: ellipse fit ───────────────────────────────────────────────────
+  const ell=fitEllipse(ex,ey);
+  if(!ell) return null;
 
-  return pupilRad;
+  const {cx:ecx,cy:ecy,semiA,semiB}=ell;
+
+  // ── Pass 10: validate ─────────────────────────────────────────────────────
+  // Center must be near iris landmark
+  const centDist=Math.sqrt((ecx-cx2)**2+(ecy-cy2)**2);
+  if(centDist>irisRad*0.30) return null;
+
+  // Semi-axes must be in anatomical range [1mm, 4mm]
+  const rMin=Math.min(semiA,semiB), rMax=Math.max(semiA,semiB);
+  if(rMin<innerR||rMax>outerR) return null;
+
+  // Aspect ratio: not too elongated (handles partial occlusion gracefully)
+  if(rMin/rMax<0.45) return null;
+
+  // Return mean semi-axis as radius estimate
+  return (semiA+semiB)/2;
 }
+
 
 // ── Eye Aspect Ratio (blink detection) ───────────────────────────────────
 // R eye: top=159 bot=145 inner=133 outer=33
@@ -982,7 +1176,7 @@ function captureValidationFrame(m, elapsed_ms){
     }
     _valCtx.setLineDash([]);
 
-    // ── Row 1: v4 threshold mask ───────────────────────────────────────────
+    // ── Row 1: v5 edge map + fitted ellipse ───────────────────────────────
     const tmp = document.createElement('canvas');
     tmp.width = size; tmp.height = size;
     const tc  = tmp.getContext('2d', {willReadFrequently: true});
@@ -990,99 +1184,117 @@ function captureValidationFrame(m, elapsed_ms){
     const imgd = tc.getImageData(0, 0, size, size);
     const pxd  = imgd.data;
 
-    const cx2 = half, cy2 = half;
-    const mmToPx2 = irisRad / 5.85;
-    // const innerR2b = (1.0*mmToPx2)**2;  // [inner disk commented out]
-    const outerR2b = (4.0*mmToPx2)**2;
-    const lidTopY2 = upperLidY != null ? (upperLidY - srcY) + LID_BUF : -1;
-    const lidBotY2 = lowerLidY != null ? (lowerLidY - srcY) - LID_BUF : size+1;
+    const cx2v = half, cy2v = half;
+    const mmToPxV = irisRad / 5.85;
+    const outerRV = 4.0*mmToPxV, outerR2V = outerRV*outerRV;
+    const lidTopV = upperLidY!=null ? (upperLidY-srcY)+LID_BUF : -1;
+    const lidBotV = lowerLidY!=null ? (lowerLidY-srcY)-LID_BUF : size+1;
 
-    const grayV = new Float32Array(size * size);
-    const zoneV = new Uint8Array(size * size);
-    for(let y = 0; y < size; y++){
-      for(let x = 0; x < size; x++){
-        const dx = x-cx2, dy = y-cy2, r2 = dx*dx+dy*dy;
-        if(r2 > outerR2b) continue;
-        if(y < lidTopY2 || y > lidBotY2) continue;
-        const i = (y*size+x)*4;
-        grayV[y*size+x] = pxd[i]*0.2126 + pxd[i+1]*0.7152 + pxd[i+2]*0.0722;
-        zoneV[y*size+x] = 2;
+    // Grayscale + zone
+    const grayV2=new Float32Array(size*size);
+    const zoneV2=new Uint8Array(size*size);
+    for(let y=0;y<size;y++){
+      for(let x=0;x<size;x++){
+        const dx=x-cx2v,dy=y-cy2v,r2=dx*dx+dy*dy;
+        if(r2>outerR2V||y<lidTopV||y>lidBotV) continue;
+        const i=(y*size+x)*4;
+        grayV2[y*size+x]=pxd[i]*0.2126+pxd[i+1]*0.7152+pxd[i+2]*0.0722;
+        zoneV2[y*size+x]=1;
       }
     }
-
-    // 3×3 box blur
-    const blurV = new Float32Array(size * size);
-    for(let y = 0; y < size; y++){
-      for(let x = 0; x < size; x++){
-        if(zoneV[y*size+x] !== 2) continue;
-        let s = 0, n = 0;
-        for(let dy = -1; dy <= 1; dy++){
-          for(let dx = -1; dx <= 1; dx++){
-            const ny=y+dy, nx=x+dx;
-            if(ny<0||ny>=size||nx<0||nx>=size) continue;
-            if(zoneV[ny*size+nx]===0) continue;
-            s += grayV[ny*size+nx]; n++;
-          }
+    // Specular mask
+    const zv=[];
+    for(let i=0;i<size*size;i++) if(zoneV2[i]) zv.push(grayV2[i]);
+    const p95v=zv.length?zv.slice().sort((a,b)=>a-b)[Math.floor(zv.length*0.95)]:255;
+    const meanV=zv.length?zv.reduce((s,v)=>s+v,0)/zv.length:128;
+    const maskedV=new Float32Array(grayV2);
+    for(let i=0;i<size*size;i++) if(zoneV2[i]&&maskedV[i]>p95v) maskedV[i]=meanV;
+    // Gaussian blur
+    const blurV2=new Float32Array(size*size);
+    gaussianBlur5(maskedV,blurV2,size,size,zoneV2);
+    // Sobel
+    const GmagV=new Float32Array(size*size);
+    const GangV=new Float32Array(size*size);
+    for(let y=1;y<size-1;y++){
+      for(let x=1;x<size-1;x++){
+        if(!zoneV2[y*size+x]) continue;
+        const p=(dy,dx)=>zoneV2[(y+dy)*size+(x+dx)]?blurV2[(y+dy)*size+(x+dx)]:blurV2[y*size+x];
+        const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
+        const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
+        GmagV[y*size+x]=Math.sqrt(gx*gx+gy*gy);
+        GangV[y*size+x]=Math.atan2(gy,gx);
+      }
+    }
+    // NMS + direction filter + hysteresis
+    const nmsV=new Uint8Array(size*size);
+    for(let y=1;y<size-1;y++){
+      for(let x=1;x<size-1;x++){
+        if(!zoneV2[y*size+x]||GmagV[y*size+x]===0) continue;
+        const deg=((GangV[y*size+x]*180/Math.PI)%180+180)%180;
+        let nx1,ny1,nx2,ny2;
+        if(deg<22.5||deg>=157.5){nx1=1;ny1=0;nx2=-1;ny2=0;}
+        else if(deg<67.5){nx1=1;ny1=1;nx2=-1;ny2=-1;}
+        else if(deg<112.5){nx1=0;ny1=1;nx2=0;ny2=-1;}
+        else{nx1=-1;ny1=1;nx2=1;ny2=-1;}
+        const m=GmagV[y*size+x];
+        const m1=zoneV2[(y+ny1)*size+(x+nx1)]?GmagV[(y+ny1)*size+(x+nx1)]:0;
+        const m2=zoneV2[(y+ny2)*size+(x+nx2)]?GmagV[(y+ny2)*size+(x+nx2)]:0;
+        if(m>=m1&&m>=m2){
+          const rx=x-cx2v,ry=y-cy2v;
+          const gdx=Math.cos(GangV[y*size+x]),gdy=Math.sin(GangV[y*size+x]);
+          if(rx*gdx+ry*gdy>0) nmsV[y*size+x]=1;
         }
-        blurV[y*size+x] = n > 0 ? s/n : grayV[y*size+x];
       }
     }
+    let maxGV=0;
+    for(let i=0;i<size*size;i++) if(nmsV[i]) maxGV=Math.max(maxGV,GmagV[i]);
+    const hiTV=maxGV*0.35,loTV=maxGV*0.15;
+    const strongV=new Uint8Array(size*size),weakV=new Uint8Array(size*size);
+    for(let i=0;i<size*size;i++){
+      if(!nmsV[i]) continue;
+      if(GmagV[i]>=hiTV) strongV[i]=1; else if(GmagV[i]>=loTV) weakV[i]=1;
+    }
+    for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+      if(!weakV[y*size+x]) continue;
+      let hs=false;
+      for(let dy=-1;dy<=1&&!hs;dy++) for(let dx=-1;dx<=1;dx++) if(strongV[(y+dy)*size+(x+dx)]) hs=true;
+      if(hs) strongV[y*size+x]=1;
+    }
 
-    // Trimmed-mean normalization
-    const rv = [];
-    for(let i = 0; i < size*size; i++) if(zoneV[i]===2) rv.push(blurV[i]);
-    rv.sort((a,b)=>a-b);
-    const tn = Math.floor(rv.length*0.90);
-    let ts = 0; for(let i=0;i<tn;i++) ts+=rv[i];
-    const tm = tn>0 ? ts/tn : 128;
-    const sc2 = tm>1 ? 128/tm : 1;
-    const THR = 70;
-
-    // Mask pixels
-    const maskd = tc.createImageData(size, size);
-    const md = maskd.data;
-    for(let y = 0; y < size; y++){
-      for(let x = 0; x < size; x++){
-        const idx = y*size+x;
-        const i = idx*4;
-        const z = zoneV[idx];
-        const dx=x-cx2, dy2=y-cy2, r2=dx*dx+dy2*dy2;
-        if(z === 0){
-          // outside zone or lid-excluded
-          const lidExcl = (y < lidTopY2 || y > lidBotY2) && r2 <= outerR2b;
-          if(lidExcl){
-            // lid exclusion band: dim orange tint
-            md[i]=60; md[i+1]=30; md[i+2]=0; md[i+3]=255;
-          } else {
-            md[i]=15; md[i+1]=15; md[i+2]=22; md[i+3]=255;
-          }
-        } else if(blurV[idx]*sc2 <= THR){
-          // pupil: bright green
-          md[i]=80; md[i+1]=255; md[i+2]=180; md[i+3]=255;
+    // Render: dark background, iris gray, edge pixels bright yellow, specular cyan
+    const maskdV=tc.createImageData(size,size); const mdV=maskdV.data;
+    for(let y=0;y<size;y++){
+      for(let x=0;x<size;x++){
+        const idx=y*size+x; const i=idx*4;
+        if(!zoneV2[idx]){
+          mdV[i]=15;mdV[i+1]=15;mdV[i+2]=22;mdV[i+3]=255;
+        } else if(grayV2[idx]>p95v){
+          // specular: cyan
+          mdV[i]=0;mdV[i+1]=220;mdV[i+2]=255;mdV[i+3]=255;
+        } else if(strongV[idx]){
+          // pupil boundary edge: bright yellow
+          mdV[i]=255;mdV[i+1]=255;mdV[i+2]=0;mdV[i+3]=255;
         } else {
-          // iris: normalized blue-gray
-          const v = Math.min(255, Math.round(blurV[idx]*sc2));
-          md[i]=v>>1; md[i+1]=v>>1; md[i+2]=v; md[i+3]=255;
+          // iris background: dimmed gray
+          const v=Math.round(blurV2[idx]*0.5);
+          mdV[i]=v;mdV[i+1]=v;mdV[i+2]=v;mdV[i+3]=255;
         }
       }
     }
-    tc.putImageData(maskd, 0, 0);
-
-    // Outer radius ring + lid lines on mask
-    tc.beginPath(); tc.arc(cx2,cy2,4.0*mmToPx2,0,Math.PI*2);
-    tc.strokeStyle='rgba(255,255,255,.3)'; tc.lineWidth=1; tc.stroke();
+    tc.putImageData(maskdV,0,0);
+    // Outer ring + lid lines
+    tc.beginPath();tc.arc(cx2v,cy2v,outerRV,0,Math.PI*2);
+    tc.strokeStyle='rgba(255,255,255,.25)';tc.lineWidth=1;tc.stroke();
     if(upperLidY!=null){
-      tc.setLineDash([3,3]); tc.strokeStyle='rgba(255,220,40,.5)'; tc.lineWidth=1;
-      tc.beginPath(); tc.moveTo(0,lidTopY2); tc.lineTo(size,lidTopY2); tc.stroke();
+      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.5)';tc.lineWidth=1;
+      tc.beginPath();tc.moveTo(0,lidTopV);tc.lineTo(size,lidTopV);tc.stroke();
     }
     if(lowerLidY!=null){
-      tc.setLineDash([3,3]); tc.strokeStyle='rgba(255,220,40,.5)'; tc.lineWidth=1;
-      tc.beginPath(); tc.moveTo(0,lidBotY2); tc.lineTo(size,lidBotY2); tc.stroke();
+      tc.setLineDash([3,3]);tc.strokeStyle='rgba(255,220,40,.5)';tc.lineWidth=1;
+      tc.beginPath();tc.moveTo(0,lidBotV);tc.lineTo(size,lidBotV);tc.stroke();
     }
     tc.setLineDash([]);
-
-    _valCtx.drawImage(tmp, 0, 0, size, size,
-                      col * CELL, PAD + CELL, CELL, CELL);
+    _valCtx.drawImage(tmp,0,0,size,size, col*CELL,PAD+CELL,CELL,CELL);
 
     // Iris + pupil circles on mask row
     _valCtx.beginPath();
@@ -1837,7 +2049,7 @@ $('exportBtn').onclick=()=>{
   // We reconstruct from the phase label in data
 
   const meta=[
-    '# PupilLens v4 Export',
+    '# PupilLens v5 Export',
     `# Date: ${new Date().toISOString()}`,
     `# Trial type: ${trialType}`,
     `# Trial start (unix ms): ${S.trialStartMs||'?'}`,
@@ -1924,8 +2136,23 @@ drawWave();
 // ── Service Worker registration ────────────────────────────────────────────
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js')
+    navigator.serviceWorker.register('./sw.js', {updateViaCache:'none'})
+      .then(reg => {
+        // When a new SW activates mid-session, reload to get fresh assets
+        reg.addEventListener('updatefound', () => {
+          const nw = reg.installing;
+          if(!nw) return;
+          nw.addEventListener('statechange', () => {
+            if(nw.state==='activated' && navigator.serviceWorker.controller)
+              window.location.reload();
+          });
+        });
+      })
       .catch(err => console.warn('SW registration failed:', err));
+    // Message from SW after clients.claim() on fresh install
+    navigator.serviceWorker.addEventListener('message', e => {
+      if(e.data?.type==='SW_UPDATED') window.location.reload();
+    });
   });
 }
 </script>

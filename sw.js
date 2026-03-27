@@ -1,3 +1,4 @@
+
 // PupilLens v6 — Service Worker
 // Cache key: bump CACHE_VER whenever index.html or assets change.
 // Strategy:

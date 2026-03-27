@@ -682,18 +682,35 @@ function ransacTaubin(hitX, hitY, innerR, outerR, cx2, cy2, irisRad,
   }
   const popSectors = sectors.map((s,i) => s.length ? i : -1).filter(i => i >= 0);
 
+  // Fall back to plain random sampling if fewer than 3 sectors populated
+  // (heavy glare or partial occlusion collapsed hits into <3 quadrants).
+  const useStratified = popSectors.length >= 3;
+
   // ── Angular-stratified RANSAC ─────────────────────────────────────────
   const centerTol = irisRad * 0.35;
   let bestInliers = [];
 
   for(let iter = 0; iter < iterations; iter++){
-    // Pick 3 distinct populated sectors, sample one hit from each
-    if(popSectors.length < 3) break;
-    const sh = popSectors.slice().sort(() => Math.random()-0.5);
-    const s0 = sh[0], s1 = sh[1], s2 = sh[2];
-    const a = sectors[s0][Math.floor(Math.random()*sectors[s0].length)];
-    const b = sectors[s1][Math.floor(Math.random()*sectors[s1].length)];
-    const c = sectors[s2][Math.floor(Math.random()*sectors[s2].length)];
+    let a, b, c;
+    if(useStratified){
+      // Fisher-Yates shuffle of sector indices, take first 3
+      const sh = popSectors.slice();
+      for(let k = sh.length-1; k > 0; k--){
+        const j = Math.floor(Math.random()*(k+1));
+        [sh[k],sh[j]] = [sh[j],sh[k]];
+      }
+      const s0 = sh[0], s1 = sh[1], s2 = sh[2];
+      a = sectors[s0][Math.floor(Math.random()*sectors[s0].length)];
+      b = sectors[s1][Math.floor(Math.random()*sectors[s1].length)];
+      c = sectors[s2][Math.floor(Math.random()*sectors[s2].length)];
+    } else {
+      // Plain random 3-point sample (original behaviour)
+      a = Math.floor(Math.random()*fn);
+      b = Math.floor(Math.random()*(fn-1)); if(b>=a) b++;
+      c = Math.floor(Math.random()*(fn-2));
+      if(c>=Math.min(a,b)) c++;
+      if(c>=Math.max(a,b)) c++;
+    }
 
     const hyp = circleFrom3(fX[a],fY[a], fX[b],fY[b], fX[c],fY[c]);
     if(!hyp) continue;
@@ -714,13 +731,21 @@ function ransacTaubin(hitX, hitY, innerR, outerR, cx2, cy2, irisRad,
   const tc = taubinCircle(bestInliers.map(i=>fX[i]), bestInliers.map(i=>fY[i]));
   if(!tc) return null;
 
-  // ── B. Arc-coverage gate (replaces 75% consistency check) ────────────
-  // Compute which inliers lie on the fitted circle, then check arc span.
-  const inlierAngles = bestInliers
-    .map(i => Math.atan2(fY[i]-tc.cy, fX[i]-tc.cx))
-    .filter((_,j) => Math.abs(Math.hypot(
-        fX[bestInliers[j]]-tc.cx, fY[bestInliers[j]]-tc.cy) - tc.r) < distThresh);
-  if(arcCoverageDeg(inlierAngles) < 120) return null;
+  // ── B. Arc-coverage gate ──────────────────────────────────────────────
+  // Check arc coverage of ALL median-filtered hits against the fitted circle.
+  // Use a looser distance threshold here (distThresh*2) because the Taubin
+  // fit on the inlier subset can shift the circle slightly from the RANSAC
+  // hypothesis, pushing genuine boundary hits just outside distThresh and
+  // falsely thinning the angle set. 90° minimum — conservative enough to
+  // reject bad glare-dominated fits but passes the 90-180° good-arc cases
+  // that were failing at 120°.
+  const arcDistThresh = distThresh * 2;
+  const allFitAngles = [];
+  for(let i = 0; i < fn; i++){
+    if(Math.abs(Math.hypot(fX[i]-tc.cx, fY[i]-tc.cy) - tc.r) < arcDistThresh)
+      allFitAngles.push(Math.atan2(fY[i]-tc.cy, fX[i]-tc.cx));
+  }
+  if(arcCoverageDeg(allFitAngles) < 90) return null;
 
   return tc;
 }

@@ -782,15 +782,37 @@ function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
     zone[y*size+x]=1;
   }
 
-  // ── 2. Specular mask ─────────────────────────────────────────────────────
+  // ── 2. Specular mask (flood-fill) ────────────────────────────────────────
+  // Pixel-by-pixel p95 threshold only removes isolated bright pixels — it
+  // leaves the *edge* of large flash reflections intact as a strong Sobel
+  // response inside the pupil. Flood-fill from any p90 seed pixel, growing
+  // into neighbors above p80, erases the entire blob including its boundary.
   const zv=[];
   for(let i=0;i<size*size;i++) if(zone[i]) zv.push(gray[i]);
   if(zv.length<20) return null;
   zv.sort((a,b)=>a-b);
-  const p95=zv[Math.floor(zv.length*0.95)];
   const zmean=zv.reduce((s,v)=>s+v,0)/zv.length;
+  const p90=zv[Math.floor(zv.length*0.90)];
+  const p80=zv[Math.floor(zv.length*0.80)];
   const masked=new Float32Array(gray);
-  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zmean;
+  const specFill=new Uint8Array(size*size);
+  const fillStack=[];
+  for(let i=0;i<size*size;i++){
+    if(zone[i]&&masked[i]>=p90&&!specFill[i]) fillStack.push(i);
+  }
+  while(fillStack.length){
+    const idx=fillStack.pop();
+    if(specFill[idx]) continue;
+    specFill[idx]=1;
+    masked[idx]=zmean;
+    const fx=idx%size, fy=(idx-fx)/size;
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+      const ny=fy+dy, nx=fx+dx;
+      if(ny<0||ny>=size||nx<0||nx>=size) continue;
+      const ni=ny*size+nx;
+      if(zone[ni]&&!specFill[ni]&&masked[ni]>p80) fillStack.push(ni);
+    }
+  }
 
   // ── 3. Gaussian blur ─────────────────────────────────────────────────────
   const blurred=new Float32Array(size*size);
@@ -914,17 +936,30 @@ function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   const goodEdge=new Uint8Array(size*size);
   for(let i=0;i<size*size;i++) if(label[i]&&goodLabel[label[i]]) goodEdge[i]=1;
 
-  // ── 10. Starburst: 24 rays, first good-edge hit per ray ─────────────────
+  // ── 10. Starburst: 24 rays, first radially-consistent good-edge hit ────────
+  // Gradient direction filter: the pupil boundary is a circle so its edge
+  // gradient must point roughly radially (toward/away from iris center).
+  // Flash reflection internal edges are roughly horizontal/vertical —
+  // their gradient is orthogonal to the ray. Reject hits where the Sobel
+  // gradient direction deviates >50° from the ray direction.
+  const RADIAL_TOL = 50 * Math.PI / 180; // 50° tolerance
   const hitX=[], hitY=[];
   for(let r=0;r<STARBURST_RAYS;r++){
     const ang=r*2*Math.PI/STARBURST_RAYS;
     const cos=Math.cos(ang), sin=Math.sin(ang);
-    // walk from innerR outward to outerR
     for(let t=innerR;t<=outerR;t+=0.7){
       const px=Math.round(cx2+cos*t);
       const py=Math.round(cy2+sin*t);
       if(px<0||px>=size||py<0||py>=size) break;
-      if(goodEdge[py*size+px]){hitX.push(px);hitY.push(py);break;}
+      if(goodEdge[py*size+px]){
+        // Check gradient direction is radial
+        const gAng=Gang[py*size+px];
+        // Angle difference mod π (gradient has 180° ambiguity)
+        let diff=Math.abs(gAng-ang)%(Math.PI);
+        if(diff>Math.PI/2) diff=Math.PI-diff;
+        if(diff<RADIAL_TOL){ hitX.push(px); hitY.push(py); }
+        break; // always break — don't walk past this edge even if rejected
+      }
     }
   }
 
@@ -1008,9 +1043,25 @@ function measurePupilFull(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   const zv=[]; for(let i=0;i<size*size;i++) if(zone[i]) zv.push(gray[i]);
   if(zv.length<20) return null;
   zv.sort((a,b)=>a-b);
-  const p95=zv[Math.floor(zv.length*0.95)], zmean=zv.reduce((s,v)=>s+v,0)/zv.length;
+  const zmean=zv.reduce((s,v)=>s+v,0)/zv.length;
+  const p90f=zv[Math.floor(zv.length*0.90)], p80f=zv[Math.floor(zv.length*0.80)];
   const masked=new Float32Array(gray);
-  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zmean;
+  const specFillF=new Uint8Array(size*size), fillStackF=[];
+  for(let i=0;i<size*size;i++){
+    if(zone[i]&&masked[i]>=p90f&&!specFillF[i]) fillStackF.push(i);
+  }
+  while(fillStackF.length){
+    const idx=fillStackF.pop();
+    if(specFillF[idx]) continue;
+    specFillF[idx]=1; masked[idx]=zmean;
+    const fx=idx%size, fy=(idx-fx)/size;
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+      const ny=fy+dy,nx=fx+dx;
+      if(ny<0||ny>=size||nx<0||nx>=size) continue;
+      const ni=ny*size+nx;
+      if(zone[ni]&&!specFillF[ni]&&masked[ni]>p80f) fillStackF.push(ni);
+    }
+  }
   const blurred=new Float32Array(size*size); gaussianBlur5(masked,blurred,size,size,zone);
 
   // Sobel+NMS+Canny (same as primary)
@@ -1105,7 +1156,13 @@ function measurePupilFull(vid, cx, cy, irisRad, upperLidY, lowerLidY){
     for(let t=innerR;t<=outerR;t+=0.7){
       const px=Math.round(cx2+cos*t),py=Math.round(cy2+sin*t);
       if(px<0||px>=size||py<0||py>=size) break;
-      if(goodEdge[py*size+px]){hitX.push(px);hitY.push(py);break;}
+      if(goodEdge[py*size+px]){
+        const gAng=Gang[py*size+px];
+        let diff=Math.abs(gAng-ang)%Math.PI;
+        if(diff>Math.PI/2) diff=Math.PI-diff;
+        if(diff<RADIAL_TOL){ hitX.push(px); hitY.push(py); }
+        break;
+      }
     }
   }
   if(hitX.length<5) return null;
@@ -1481,11 +1538,25 @@ function captureValidationFrame(m, elapsed_ms){
     // Specular mask
     const zvv=[]; for(let i=0;i<size*size;i++) if(zV[i]) zvv.push(gV[i]);
     zvv.sort((a,b)=>a-b);
-    const p95v=zvv.length?zvv[Math.floor(zvv.length*0.95)]:255;
     const zmv=zvv.length?zvv.reduce((s,v)=>s+v,0)/zvv.length:128;
+    const p90v=zvv.length?zvv[Math.floor(zvv.length*0.90)]:230;
+    const p80v=zvv.length?zvv[Math.floor(zvv.length*0.80)]:200;
     const specV=new Uint8Array(size*size);
     const mV=new Float32Array(gV);
-    for(let i=0;i<size*size;i++) if(zV[i]&&mV[i]>p95v){mV[i]=zmv;specV[i]=1;}
+    // Flood-fill specular blobs (mirrors measurePupil)
+    const sfStk=[];
+    for(let i=0;i<size*size;i++) if(zV[i]&&mV[i]>=p90v&&!specV[i]) sfStk.push(i);
+    while(sfStk.length){
+      const idx=sfStk.pop(); if(specV[idx]) continue;
+      specV[idx]=1; mV[idx]=zmv;
+      const fx=idx%size,fy=(idx-fx)/size;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const ny=fy+dy,nx=fx+dx;
+        if(ny<0||ny>=size||nx<0||nx>=size) continue;
+        const ni=ny*size+nx;
+        if(zV[ni]&&!specV[ni]&&mV[ni]>p80v) sfStk.push(ni);
+      }
+    }
     // Blur + Sobel + NMS + Hysteresis (mirror measurePupil)
     const bV=new Float32Array(size*size); gaussianBlur5(mV,bV,size,size,zV);
     const GmV=new Float32Array(size*size),GaV=new Float32Array(size*size);

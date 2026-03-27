@@ -15,6 +15,16 @@ Browser-based iris tracking and pupil light reflex (PLR) protocol — no install
 - Exports per-frame data as **CSV** with full metadata (camera exposure, flash parameters, segment timestamps)
 - Works offline after first load (service worker caches all assets)
 
+- Flood-fill specular mask (p90 seed → p80 grow) — this is attacking the glare problem at source, replacing reflection blobs with mean intensity before edge detection
+- Sobel + NMS + Canny hysteresis — proper edge pipeline, not just raw gradients
+- Morphological thinning — junction blob removal + L-corner removal (borrowed from ElSe/PuRe)
+- Connected components + photometric filter — inner darker than outer check (ElSe-style), centroid proximity filter
+- Radial gradient filter on starburst hits — 50° tolerance, this IS essentially the Swirski2D image-aware support function
+- Median pre-filter on radii — 28% deviation gate before RANSAC
+- RANSAC with anatomical fast-reject — radius bounds + center tolerance
+- 75% consistency check on ALL hits — not just RANSAC inliers, this is strong
+- PuRe outline contrast confidence — photometric validation post-fit
+- Taubin fallback — median filter only, no 75% gate, lower bar
 ---
 
 ## Files

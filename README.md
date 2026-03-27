@@ -2,7 +2,7 @@
 
 Browser-based iris tracking and pupil light reflex (PLR) protocol — no install, no server, runs entirely client-side.
 
-**Live demo:** `https://<your-username>.github.io/<repo-name>/`
+**Live demo:** https://jeffreysparker-collab.github.io/pupillens/
 
 ---
 

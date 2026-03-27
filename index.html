@@ -610,6 +610,89 @@ function gaussianBlur5(src, dst, w, h, mask){
   }
 }
 
+// ── Exact circle through 3 points ────────────────────────────────────────
+// Returns {cx,cy,r} or null if points are collinear.
+function circleFrom3(x1,y1, x2,y2, x3,y3){
+  const ax=x2-x1, ay=y2-y1;
+  const bx=x3-x1, by=y3-y1;
+  const D=2*(ax*by-ay*bx);
+  if(Math.abs(D)<1e-10) return null;
+  const ux=( by*(ax*ax+ay*ay) - ay*(bx*bx+by*by) )/D;
+  const uy=( ax*(bx*bx+by*by) - bx*(ax*ax+ay*ay) )/D;
+  const cx=x1+ux, cy=y1+uy;
+  return {cx, cy, r:Math.hypot(ux,uy)};
+}
+
+// ── RANSAC-Taubin circle fit ──────────────────────────────────────────────
+// Wraps taubinCircle with RANSAC outlier rejection.
+// 1. Median-radius pre-filter: drop hits >25% from median (cheap, kills
+//    gross limbus/specular outliers before RANSAC even starts).
+// 2. RANSAC: 40 iterations × 3-point minimal sample; count inliers within
+//    distThresh px of the hypothesis circle; require radius in [innerR,outerR]
+//    and center within centerTol of iris center.
+// 3. Final Taubin fit on best inlier set.
+// 4. Hard 75% inlier consistency check on the final fit — reject if fewer
+//    than 75% of original hits lie within distThresh of the fitted circle.
+function ransacTaubin(hitX, hitY, innerR, outerR, cx2, cy2, irisRad,
+                      distThresh=2.5, iterations=40){
+  const n = hitX.length;
+  if(n < 5) return null;
+
+  // ── Median pre-filter ──────────────────────────────────────────────────
+  const radii = hitX.map((x,i) => Math.hypot(x-cx2, hitY[i]-cy2));
+  const sorted = radii.slice().sort((a,b)=>a-b);
+  const medR   = sorted[Math.floor(sorted.length/2)];
+  const fIdx   = radii.map((_,i)=>i).filter(i => Math.abs(radii[i]-medR)/medR < 0.28);
+  if(fIdx.length < 5) return null;
+  const fX = fIdx.map(i=>hitX[i]);
+  const fY = fIdx.map(i=>hitY[i]);
+  const fn = fX.length;
+
+  // ── RANSAC ────────────────────────────────────────────────────────────
+  const centerTol = irisRad * 0.35;
+  let bestInliers = [];
+
+  for(let iter=0; iter<iterations; iter++){
+    // Sample 3 distinct indices
+    const a = Math.floor(Math.random()*fn);
+    let b = Math.floor(Math.random()*(fn-1)); if(b>=a) b++;
+    let c = Math.floor(Math.random()*(fn-2));
+    if(c>=Math.min(a,b)) c++;
+    if(c>=Math.max(a,b)) c++;
+
+    const hyp = circleFrom3(fX[a],fY[a], fX[b],fY[b], fX[c],fY[c]);
+    if(!hyp) continue;
+    // Fast-reject: radius or center out of anatomical bounds
+    if(hyp.r < innerR || hyp.r > outerR) continue;
+    if(Math.hypot(hyp.cx-cx2, hyp.cy-cy2) > centerTol) continue;
+
+    const inliers = [];
+    for(let i=0; i<fn; i++){
+      if(Math.abs(Math.hypot(fX[i]-hyp.cx, fY[i]-hyp.cy) - hyp.r) < distThresh)
+        inliers.push(i);
+    }
+    if(inliers.length > bestInliers.length) bestInliers = inliers;
+  }
+
+  if(bestInliers.length < 5) return null;
+
+  // ── Final Taubin fit on inlier set ────────────────────────────────────
+  const tc = taubinCircle(bestInliers.map(i=>fX[i]), bestInliers.map(i=>fY[i]));
+  if(!tc) return null;
+
+  // ── Hard 75% consistency check on ALL original hits ───────────────────
+  // Ensures the final circle agrees with the majority of evidence,
+  // not just the RANSAC-selected subset.
+  let consistent = 0;
+  for(let i=0; i<n; i++){
+    if(Math.abs(Math.hypot(hitX[i]-tc.cx, hitY[i]-tc.cy) - tc.r) < distThresh)
+      consistent++;
+  }
+  if(consistent / n < 0.75) return null;
+
+  return tc;
+}
+
 // ── Taubin circle fit ────────────────────────────────────────────────────
 // Minimises algebraic distance with Taubin's normalization.
 // Input: arrays xs[], ys[]. Returns {cx,cy,r} or null.
@@ -846,8 +929,10 @@ function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
 
   if(hitX.length<5) return null;
 
-  // ── 11. Taubin circle fit ────────────────────────────────────────────────
-  const tc=taubinCircle(hitX,hitY);
+  // ── 11. RANSAC-Taubin circle fit ─────────────────────────────────────────
+  // Median pre-filter + RANSAC outlier rejection + final Taubin on inliers.
+  // Hard 75% consistency check ensures the circle agrees with the full set.
+  const tc=ransacTaubin(hitX,hitY,innerR,outerR,cx2,cy2,irisRad);
   if(!tc) return null;
   const {cx:tcx,cy:tcy,r:tr}=tc;
 
@@ -1322,8 +1407,9 @@ function captureValidationFrame(m, elapsed_ms){
         if(geV[py*size+px]){hxV.push(px);hyV.push(py);break;}
       }
     }
-    // Taubin fit
-    const tcRes=hxV.length>=5?taubinCircle(hxV,hyV):null;
+    // Circle fits — raw Taubin (shows what outliers would cause) + RANSAC result
+    const tcRaw  = hxV.length>=5 ? taubinCircle(hxV,hyV) : null;
+    const tcRans = hxV.length>=5 ? ransacTaubin(hxV,hyV,innerRV,outerRV,cx2v,cy2v,irisRad) : null;
 
     // Render pixel map
     const mdV=tc.createImageData(size,size); const mdVd=mdV.data;
@@ -1352,10 +1438,19 @@ function captureValidationFrame(m, elapsed_ms){
       tc.fillRect(hxV[hi]-1,hyV[hi]-1,3,3);
     });
 
-    // Fitted circle (cyan)
-    if(tcRes){
-      tc.beginPath();tc.arc(tcRes.cx,tcRes.cy,tcRes.r,0,Math.PI*2);
+    // Raw Taubin (dim orange) — shows where outliers would have pulled the fit
+    if(tcRaw && (!tcRans || Math.abs(tcRaw.r - (tcRans?.r||0)) > 1.5)){
+      tc.beginPath();tc.arc(tcRaw.cx,tcRaw.cy,tcRaw.r,0,Math.PI*2);
+      tc.strokeStyle='rgba(255,140,0,.5)';tc.lineWidth=1;tc.stroke();
+    }
+    // RANSAC-Taubin result (bright cyan) — what measurePupil actually returned
+    if(tcRans){
+      tc.beginPath();tc.arc(tcRans.cx,tcRans.cy,tcRans.r,0,Math.PI*2);
       tc.strokeStyle='rgba(0,255,220,.9)';tc.lineWidth=1.5;tc.stroke();
+    } else if(tcRaw && !tcRans){
+      // RANSAC rejected — show raw in red so it's obvious
+      tc.beginPath();tc.arc(tcRaw.cx,tcRaw.cy,tcRaw.r,0,Math.PI*2);
+      tc.strokeStyle='rgba(255,60,60,.8)';tc.lineWidth=1.5;tc.stroke();
     }
 
     // Outer zone ring + lid lines

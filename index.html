@@ -118,7 +118,7 @@ header{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 18px;
 .qbadge.bad{border-color:var(--accent3);color:var(--accent3)}
 
 /* Raw debug */
-.rawrow{font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:6px;line-height:1.9}
+.rawrow{font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:6px;line-height:1.6;min-height:52px;overflow:hidden}
 .rawval{color:var(--accent)}
 
 /* Waveform */
@@ -460,6 +460,7 @@ function setFlashRegion(fullScreen){
 const S={
   running:false, detector:null, lastT:-1, frameCount:0,
   smoothLpx:null, smoothRpx:null,
+  smoothLmm:null, smoothRmm:null,
   baselineLpx:null, baselineRpx:null,
   hist:{l:[],r:[]}, samples:[], trialData:[],
   lastResults:null, trialRunning:false, currentRep:null,
@@ -966,9 +967,185 @@ function measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY){
   const conf=evaluated>0?passed/evaluated:0;
   if(conf<0.35) return null; // reject if < 35% of samples pass
 
-  return {r:tr, conf};
+  // RANSAC succeeded → perfect geometric consistency, conf=1.
+  // If RANSAC was used (tc came from ransacTaubin) that's already baked in above.
+  // We return the PuRe photometric conf as-is; caller knows RANSAC was used.
+  return {r:tr, conf, ransac:true};
 }
 
+// ── measurePupil with Taubin fallback ────────────────────────────────────
+// If ransacTaubin rejects (outliers dominate), retry with bare taubinCircle
+// on the median-filtered hit set so frames with moderate noise still report.
+// Fallback result is flagged conf<1 from the PuRe check alone.
+function measurePupilFull(vid, cx, cy, irisRad, upperLidY, lowerLidY){
+  const primary = measurePupil(vid, cx, cy, irisRad, upperLidY, lowerLidY);
+  if(primary) return primary;
+
+  // ── Taubin fallback: repeat starburst + bare Taubin, no RANSAC ───────────
+  if(!vid||!vid.videoWidth||irisRad<4) return null;
+  const vw=vid.videoWidth, vh=vid.videoHeight;
+  const size=Math.round(irisRad*2)*2, half=size/2;
+  const srcX=Math.round(cx-half), srcY=Math.round(cy-half);
+  if(srcX<0||srcY<0||srcX+size>vw||srcY+size>vh) return null;
+
+  _pupilCanvas.width=size; _pupilCanvas.height=size;
+  _pupilCtx.drawImage(vid, srcX,srcY, size,size, 0,0, size,size);
+  const {data}=_pupilCtx.getImageData(0,0,size,size);
+
+  const mmToPx=irisRad/5.85;
+  const outerR=4.0*mmToPx, outerR2=outerR*outerR, innerR=1.0*mmToPx;
+  const cx2=half, cy2=half;
+  const lidTopY=upperLidY!=null?(upperLidY-srcY)+LID_BUF:-1;
+  const lidBotY=lowerLidY!=null?(lowerLidY-srcY)-LID_BUF:size+1;
+
+  const gray=new Float32Array(size*size), zone=new Uint8Array(size*size);
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
+    if(r2>outerR2||y<lidTopY||y>lidBotY) continue;
+    const i=(y*size+x)*4;
+    gray[y*size+x]=data[i]*0.2126+data[i+1]*0.7152+data[i+2]*0.0722; zone[y*size+x]=1;
+  }
+  const zv=[]; for(let i=0;i<size*size;i++) if(zone[i]) zv.push(gray[i]);
+  if(zv.length<20) return null;
+  zv.sort((a,b)=>a-b);
+  const p95=zv[Math.floor(zv.length*0.95)], zmean=zv.reduce((s,v)=>s+v,0)/zv.length;
+  const masked=new Float32Array(gray);
+  for(let i=0;i<size*size;i++) if(zone[i]&&masked[i]>p95) masked[i]=zmean;
+  const blurred=new Float32Array(size*size); gaussianBlur5(masked,blurred,size,size,zone);
+
+  // Sobel+NMS+Canny (same as primary)
+  const Gmag=new Float32Array(size*size), Gang=new Float32Array(size*size);
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!zone[y*size+x]) continue;
+    const p=(dy,dx)=>zone[(y+dy)*size+(x+dx)]?blurred[(y+dy)*size+(x+dx)]:blurred[y*size+x];
+    const gx=-p(-1,-1)-2*p(0,-1)-p(1,-1)+p(-1,1)+2*p(0,1)+p(1,1);
+    const gy=-p(-1,-1)-2*p(-1,0)-p(-1,1)+p(1,-1)+2*p(1,0)+p(1,1);
+    Gmag[y*size+x]=Math.sqrt(gx*gx+gy*gy); Gang[y*size+x]=Math.atan2(gy,gx);
+  }
+  const nms=new Uint8Array(size*size);
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!zone[y*size+x]||!Gmag[y*size+x]) continue;
+    const deg=((Gang[y*size+x]*180/Math.PI)%180+180)%180;
+    let nx1,ny1,nx2,ny2;
+    if(deg<22.5||deg>=157.5){nx1=1;ny1=0;nx2=-1;ny2=0;}
+    else if(deg<67.5){nx1=1;ny1=1;nx2=-1;ny2=-1;}
+    else if(deg<112.5){nx1=0;ny1=1;nx2=0;ny2=-1;}
+    else{nx1=-1;ny1=1;nx2=1;ny2=-1;}
+    const m=Gmag[y*size+x];
+    const m1=zone[(y+ny1)*size+(x+nx1)]?Gmag[(y+ny1)*size+(x+nx1)]:0;
+    const m2=zone[(y+ny2)*size+(x+nx2)]?Gmag[(y+ny2)*size+(x+nx2)]:0;
+    if(m>=m1&&m>=m2) nms[y*size+x]=1;
+  }
+  let maxG=0; for(let i=0;i<size*size;i++) if(nms[i]) maxG=Math.max(maxG,Gmag[i]);
+  if(maxG<1) return null;
+  const hiT=maxG*0.30, loT=maxG*0.10;
+  const strong=new Uint8Array(size*size), weak=new Uint8Array(size*size);
+  for(let i=0;i<size*size;i++){
+    if(!nms[i]) continue;
+    if(Gmag[i]>=hiT) strong[i]=1; else if(Gmag[i]>=loT) weak[i]=1;
+  }
+  for(let y=1;y<size-1;y++) for(let x=1;x<size-1;x++){
+    if(!weak[y*size+x]) continue;
+    let ok=false;
+    for(let dy=-1;dy<=1&&!ok;dy++) for(let dx=-1;dx<=1;dx++) if(strong[(y+dy)*size+(x+dx)]) ok=true;
+    if(ok) strong[y*size+x]=1;
+  }
+  for(let y=2;y<size-2;y++) for(let x=2;x<size-2;x++){
+    if(!strong[y*size+x]) continue;
+    let neig=0;
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) if(strong[(y+dy)*size+(x+dx)]) neig++;
+    if(neig>4){strong[y*size+x]=0;continue;}
+    const n=strong[(y-1)*size+x],s=strong[(y+1)*size+x],e=strong[y*size+(x+1)],w=strong[y*size+(x-1)];
+    if((e&&s)||(e&&n)||(w&&s)||(w&&n)) strong[y*size+x]=0;
+  }
+  // Connected components + photometric filter (same as primary)
+  const label=new Int16Array(size*size); let numLabels=0;
+  const compSize=[],compSx=[],compSy=[];
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    if(!strong[y*size+x]||label[y*size+x]) continue;
+    numLabels++; const lbl=numLabels; const stack=[y*size+x]; label[y*size+x]=lbl;
+    let cnt=0,sx=0,sy=0;
+    while(stack.length){
+      const idx=stack.pop(); const px=idx%size,py=(idx-px)/size;
+      cnt++;sx+=px;sy+=py;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const ny=py+dy,nx=px+dx;
+        if(ny<0||ny>=size||nx<0||nx>=size) continue;
+        const ni=ny*size+nx;
+        if(strong[ni]&&!label[ni]){label[ni]=lbl;stack.push(ni);}
+      }
+    }
+    compSize.push(cnt);compSx.push(sx);compSy.push(sy);
+  }
+  const innerMeanR=outerR*0.5,innerMeanR2=innerMeanR*innerMeanR;
+  let innerSum=0,innerCnt=0,outerSum=0,outerCnt=0;
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    if(!zone[y*size+x]) continue;
+    const dx=x-cx2,dy=y-cy2,r2=dx*dx+dy*dy;
+    if(r2<innerMeanR2){innerSum+=blurred[y*size+x];innerCnt++;}
+    else if(r2<=outerR2){outerSum+=blurred[y*size+x];outerCnt++;}
+  }
+  const innerMean=innerCnt?innerSum/innerCnt:0, outerMean=outerCnt?outerSum/outerCnt:255;
+  const innerDarker=innerMean<outerMean-5;
+  const goodLabel=new Uint8Array(numLabels+1);
+  for(let l=1;l<=numLabels;l++){
+    if(compSize[l-1]<10) continue;
+    const mx2=compSx[l-1]/compSize[l-1],my2=compSy[l-1]/compSize[l-1];
+    if(Math.sqrt((mx2-cx2)**2+(my2-cy2)**2)>irisRad*0.4) continue;
+    if(!innerDarker) continue;
+    goodLabel[l]=1;
+  }
+  const goodEdge=new Uint8Array(size*size);
+  for(let i=0;i<size*size;i++) if(label[i]&&goodLabel[label[i]]) goodEdge[i]=1;
+
+  const hitX=[],hitY=[];
+  for(let r=0;r<STARBURST_RAYS;r++){
+    const ang=r*2*Math.PI/STARBURST_RAYS;
+    const cos=Math.cos(ang),sin=Math.sin(ang);
+    for(let t=innerR;t<=outerR;t+=0.7){
+      const px=Math.round(cx2+cos*t),py=Math.round(cy2+sin*t);
+      if(px<0||px>=size||py<0||py>=size) break;
+      if(goodEdge[py*size+px]){hitX.push(px);hitY.push(py);break;}
+    }
+  }
+  if(hitX.length<5) return null;
+
+  // Median pre-filter only (no RANSAC 75% gate)
+  const radii=hitX.map((x,i)=>Math.hypot(x-cx2,hitY[i]-cy2));
+  const sorted=radii.slice().sort((a,b)=>a-b);
+  const medR=sorted[Math.floor(sorted.length/2)];
+  const fIdx=radii.map((_,i)=>i).filter(i=>Math.abs(radii[i]-medR)/medR<0.28);
+  if(fIdx.length<5) return null;
+  const fX=fIdx.map(i=>hitX[i]),fY=fIdx.map(i=>hitY[i]);
+
+  const tc=taubinCircle(fX,fY);
+  if(!tc) return null;
+  const {cx:tcx,cy:tcy,r:tr}=tc;
+  if(Math.sqrt((tcx-cx2)**2+(tcy-cy2)**2)>irisRad*0.35) return null;
+  if(tr<innerR||tr>outerR) return null;
+
+  // PuRe conf
+  const DELTA=Math.round(tr*0.15)||2;
+  let evaluated=0,passed=0;
+  for(let r=0;r<STARBURST_RAYS;r++){
+    const ang=r*2*Math.PI/STARBURST_RAYS;
+    const cos=Math.cos(ang),sin=Math.sin(ang);
+    const px=tcx+cos*tr,py=tcy+sin*tr;
+    let inner=0,outer=0,ic=0,oc=0;
+    for(let d=1;d<=DELTA;d++){
+      const ix=Math.round(px-cos*d),iy=Math.round(py-sin*d);
+      const ox=Math.round(px+cos*d),oy=Math.round(py+sin*d);
+      if(ix>=0&&ix<size&&iy>=0&&iy<size&&zone[iy*size+ix]){inner+=blurred[iy*size+ix];ic++;}
+      if(ox>=0&&ox<size&&oy>=0&&oy<size&&zone[oy*size+ox]){outer+=blurred[oy*size+ox];oc++;}
+    }
+    if(!ic||!oc) continue;
+    evaluated++;
+    if(inner/ic<outer/oc-3) passed++;
+  }
+  const conf=evaluated>0?passed/evaluated:0;
+  if(conf<0.25) return null; // lower bar for fallback — S-G will smooth it
+  return {r:tr, conf, ransac:false};
+}
 
 // ── Eye Aspect Ratio (blink detection) ───────────────────────────────────
 // R eye: top=159 bot=145 inner=133 outer=33
@@ -1014,8 +1191,8 @@ function measure(kps){
   // Measure actual pupil size from video pixels using iris center as anchor
   const lUpperLidY = kps[386].y, lLowerLidY = kps[374].y;
   const rUpperLidY = kps[159].y, rLowerLidY = kps[145].y;
-  const lResult = measurePupil(video, kps[473].x, kps[473].y, lRad, lUpperLidY, lLowerLidY);
-  const rResult = measurePupil(video, kps[468].x, kps[468].y, rRad, rUpperLidY, rLowerLidY);
+  const lResult = measurePupilFull(video, kps[473].x, kps[473].y, lRad, lUpperLidY, lLowerLidY);
+  const rResult = measurePupilFull(video, kps[468].x, kps[468].y, rRad, rUpperLidY, rLowerLidY);
   const lPupilPx   = lResult?.r   ?? null;
   const rPupilPx   = rResult?.r   ?? null;
   const lPupilConf = lResult?.conf ?? null;
@@ -1507,21 +1684,30 @@ function updateUI(m){
   S.smoothRpx=ema(S.smoothRpx,rawR);
   const L=S.smoothLpx, R=S.smoothRpx;
 
-  // Display: mm when available, pupil px otherwise
-  const showMm = m.lPupilMm!=null && m.lPupilMm>0.5 && m.lPupilMm<15;
-  if(showMm){
-    $('Lpct').textContent=m.lPupilMm.toFixed(2);
-    $('Rpct').textContent=m.rPupilMm.toFixed(2);
+  // ── Display: always mm when scale is available, stable EMA ───────────────
+  // Smooth mm independently so unit never flickers between frames.
+  // Fall back to px only if mm/px scale is genuinely not yet established.
+  if(m.lPupilMm!=null && m.lPupilMm>0.5 && m.lPupilMm<15)
+    S.smoothLmm=ema(S.smoothLmm, m.lPupilMm, 0.18);
+  if(m.rPupilMm!=null && m.rPupilMm>0.5 && m.rPupilMm<15)
+    S.smoothRmm=ema(S.smoothRmm, m.rPupilMm, 0.18);
+
+  const haveMm = S.smoothLmm!=null && S.smoothRmm!=null;
+  if(haveMm){
+    $('Lpct').textContent=S.smoothLmm.toFixed(2);
+    $('Rpct').textContent=S.smoothRmm.toFixed(2);
     document.querySelectorAll('.eunit').forEach(el=>el.textContent='pupil mm');
   }else{
     $('Lpct').textContent=L.toFixed(1);
     $('Rpct').textContent=R.toFixed(1);
     document.querySelectorAll('.eunit').forEach(el=>el.textContent='pupil px');
   }
-  const diagStr = `iris:${m.lHorizPx?.toFixed(0)||'?'}px ok:${m.lDiamOk?'✓':'✗'}`;
-  $('rawL').textContent=`pupil=${m.lPupilPx!=null?m.lPupilPx.toFixed(1)+'px':'—'} ${m.lPupilMm!=null?m.lPupilMm.toFixed(2)+'mm':'no mm'} iris=${m.lIrisMm!=null?m.lIrisMm.toFixed(1)+'mm':'—'}`;
-  $('rawR').textContent=`pupil=${m.rPupilPx!=null?m.rPupilPx.toFixed(1)+'px':'—'} ${m.rPupilMm!=null?m.rPupilMm.toFixed(2)+'mm':'no mm'} iris=${m.rIrisMm!=null?m.rIrisMm.toFixed(1)+'mm':'—'}`;
-  $('rawEAR').textContent=`EAR ${m.lEAR.toFixed(2)}/${m.rEAR.toFixed(2)} ${diagStr}`;
+  const fmtPx = v => v!=null ? v.toFixed(1).padStart(5)+'px' : '  —  px';
+  const fmtMm = v => v!=null ? v.toFixed(2).padStart(5)+'mm' : '  —  mm';
+  const fmtIr = v => v!=null ? v.toFixed(1).padStart(5)+'mm' : '  —  mm';
+  $('rawL').textContent=`pupil ${fmtPx(m.lPupilPx)} ${fmtMm(m.lPupilMm)} iris ${fmtIr(m.lIrisMm)}`;
+  $('rawR').textContent=`pupil ${fmtPx(m.rPupilPx)} ${fmtMm(m.rPupilMm)} iris ${fmtIr(m.rIrisMm)}`;
+  $('rawEAR').textContent=`EAR L${m.lEAR.toFixed(2)} R${m.rEAR.toFixed(2)}  iris ${m.lHorizPx?.toFixed(0)||'?'}px ${m.lDiamOk?'✓':'✗'}`;
 
   // Delta from baseline (if set) or from previous frame
   const refL=S.baselineLpx||_prevL, refR=S.baselineRpx||_prevR;
@@ -1643,7 +1829,7 @@ async function loop(){
         }
       }
     }else{
-      S.smoothLpx=null;S.smoothRpx=null;
+      S.smoothLpx=null;S.smoothRpx=null;S.smoothLmm=null;S.smoothRmm=null;
       $('Lpct').textContent='—';$('Rpct').textContent='—';
       if(!S.trialRunning)setStatus('NO FACE','warn');
     }
@@ -1819,7 +2005,7 @@ async function runTrial(colorSweep=false){
   S.currentFlashColor=null;
   S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   // Reset EMA smoothing so trial starts from clean state
-  S.smoothLpx=null;S.smoothRpx=null;
+  S.smoothLpx=null;S.smoothRpx=null;S.smoothLmm=null;S.smoothRmm=null;
   _prevL=null;_prevR=null;
   $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
   $('trialBtn').classList.add('running');
@@ -1912,7 +2098,7 @@ async function runDampingTrial(){
   S.trialStartMs=Date.now();
   S.trialType='REFLEX_DAMPING';
   S.baselineLpx=null;S.baselineRpx=null;S.currentRep=null;
-  S.smoothLpx=null;S.smoothRpx=null;
+  S.smoothLpx=null;S.smoothRpx=null;S.smoothLmm=null;S.smoothRmm=null;
   _prevL=null;_prevR=null;
   S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   $('trialBtn').disabled=true;$('colorBtn').disabled=true;$('dampBtn').disabled=true;
@@ -2199,7 +2385,7 @@ $('stopBtn').onclick=()=>{
   $('splash').classList.remove('gone');
   $('startBtn').disabled=false;$('startBtn').textContent='Restart';
   ['stopBtn','snapBtn','trialBtn','colorBtn','dampBtn'].forEach(id=>$(id).disabled=true);
-  S.smoothLpx=S.smoothRpx=null;
+  S.smoothLpx=S.smoothRpx=S.smoothLmm=S.smoothRmm=null;
   setStatus('STOPPED');
 };
 
@@ -2293,7 +2479,7 @@ $('exportBtn').onclick=()=>{
 
 $('clearBtn').onclick=()=>{
   S.samples=[];S.hist.l=[];S.hist.r=[];S.trialData=[];S.lastResults=null;
-  S.smoothLpx=S.smoothRpx=S.baselineLpx=S.baselineRpx=null;
+  S.smoothLpx=S.smoothRpx=S.smoothLmm=S.smoothRmm=S.baselineLpx=S.baselineRpx=null;
   S.currentRep=null;
   S.valFrames=[];S.flashOnTime=null;S.flashOffTime=null;S.lastValFrameTime=null;
   _prevL=_prevR=null;

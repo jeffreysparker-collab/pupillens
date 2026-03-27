@@ -1,4 +1,4 @@
-// PupilLens v5 — Service Worker
+// PupilLens v6 — Service Worker
 // Cache key: bump CACHE_VER whenever index.html or assets change.
 // Strategy:
 //   • App shell (index, manifest, icons) → cache-first, update in background

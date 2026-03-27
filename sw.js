@@ -5,7 +5,7 @@
 //   • CDN scripts (MediaPipe, TF.js)     → cache-first (pinned versions)
 //   • Everything else                    → network-first with cache fallback
 
-const CACHE_VER = 'pupillens-v6-20260326';
+const CACHE_VER = 'pupillens-v6-20260327';
 
 const SHELL = [
   './',

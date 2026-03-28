@@ -388,6 +388,7 @@ table.res td.bad{color:var(--accent3)}
     <div class="sec">
       <div class="btnrow">
         <button class="bsm" id="exportBtn">↓ Trial CSV</button>
+        <button class="bsm" id="algoLogBtn">↓ Algo Log</button>
         <button class="bsm" id="exportValBtn" style="display:none">↓ Val Frames</button>
         <button class="bsm red" id="clearBtn">✕ Clear</button>
         <button class="bsm red" id="stopBtn" disabled>■ Stop</button>
@@ -968,6 +969,13 @@ function updateUI(m){
   if(S.trialRunning&&currentPhase){
     const now=Date.now();
     const lPx=m.lPupilPx??0, rPx=m.rPupilPx??0;
+    // Snapshot per-algo results for this frame (both eyes)
+    const algoSnap={};
+    for(const id of S.selectedAlgos){
+      const r=S.lastAlgoResults[id];
+      algoSnap[id]={lMm:r?.pupilMm??null, lConf:r?.confidence??null,
+                    rMm:null, rConf:null, failStage:r?.failStage??null};
+    }
     S.trialData.push({
       t_ms:now,
       elapsed_ms:S.trialStartMs?now-S.trialStartMs:0,
@@ -981,6 +989,7 @@ function updateUI(m){
       flashColor:S.currentFlashColor||'',
       lConf:m.lPupilConf,rConf:m.rPupilConf,
       algos:[...S.selectedAlgos].join('+'),
+      algoSnap,
     });
     captureValidationFrame(m,S.trialStartMs?now-S.trialStartMs:0);
     if(currentPhase==='baseline'){
@@ -1107,7 +1116,7 @@ async function countdown(secs,label,phaseId){
 
 async function runTrial(colorSweep=false){
   if(S.trialRunning||!S.running)return;
-  S.trialRunning=true;S.trialData=[];currentPhase='';
+  S.trialRunning=true;window._plTrialActive=true;S.trialData=[];currentPhase='';
   S.trialStartMs=Date.now();S.trialType=colorSweep?'CHROMATIC':'PLR';
   S.baselineLpx=S.baselineRpx=S.currentRep=S.currentFlashColor=null;
   S.valFrames=[];S.flashOnTime=S.flashOffTime=S.lastValFrameTime=null;
@@ -1161,7 +1170,7 @@ async function runTrial(colorSweep=false){
 
 async function runDampingTrial(){
   if(S.trialRunning||!S.running)return;
-  S.trialRunning=true;S.trialData=[];currentPhase='';
+  S.trialRunning=true;window._plTrialActive=true;S.trialData=[];currentPhase='';
   S.trialStartMs=Date.now();S.trialType='REFLEX_DAMPING';
   S.baselineLpx=S.baselineRpx=S.currentRep=null;
   S.smoothLmm=S.smoothRmm=null;_prevL=_prevR=null;
@@ -1197,7 +1206,7 @@ async function runDampingTrial(){
 }
 
 function endDampingTrial(){
-  S.trialRunning=false;currentPhase='';hideCountdown();setFlashRegion(true);
+  S.trialRunning=false;window._plTrialActive=false;currentPhase='';hideCountdown();setFlashRegion(true);
   $('cam').classList.remove('trial');
   $('trialBtn').disabled=$('colorBtn').disabled=$('dampBtn').disabled=false;
   $('dampBtn').classList.remove('running');
@@ -1206,7 +1215,7 @@ function endDampingTrial(){
   setStatus('TRACKING','on');
 }
 function endTrial(){
-  S.trialRunning=false;currentPhase='';hideCountdown();setFlashRegion(true);
+  S.trialRunning=false;window._plTrialActive=false;currentPhase='';hideCountdown();setFlashRegion(true);
   $('cam').classList.remove('trial');
   $('trialBtn').disabled=$('colorBtn').disabled=$('dampBtn').disabled=false;
   $('trialBtn').classList.remove('running');$('trialBtn').textContent='▶ START PLR TRIAL';
@@ -1371,6 +1380,15 @@ $('exportBtn').onclick=()=>{
   const useHalf=$('halfScreenChk')?.checked||false;
   const trialType=S.trialType||'PLR';
   const algoList=[...S.selectedAlgos].join('+');
+
+  // Collect every algo id that appears in any row's algoSnap
+  const algoIds=[...S.selectedAlgos];
+
+  // Build per-algo column headers: {algo}_l_mm, {algo}_l_conf, {algo}_fail
+  const algoHeaders=algoIds.flatMap(id=>[
+    `${id}_l_mm`,`${id}_l_conf`,`${id}_fail`
+  ]);
+
   const meta=[
     '# PupilLens v8 Export',
     `# Date: ${new Date().toISOString()}`,
@@ -1379,17 +1397,35 @@ $('exportBtn').onclick=()=>{
     `# Trial start (unix ms): ${S.trialStartMs||'?'}`,
     `# Camera: frameRate=${camSettings.frameRate||'?'}fps  exposureTime=${camSettings.exposureTime||'?'}μs`,
     '#',
-    't_ms,elapsed_ms,segment,rep,trial_type,flash_color,algos,left_pupil_px,right_pupil_px,left_pupil_mm,right_pupil_mm,left_iris_radius_px,right_iris_radius_px,left_iris_mm,right_iris_mm,tilt_ratio,quality,left_conf,right_conf',
+    ['t_ms','elapsed_ms','segment','rep','trial_type','flash_color','algos',
+     'left_pupil_px','right_pupil_px','left_pupil_mm','right_pupil_mm',
+     'left_iris_radius_px','right_iris_radius_px','left_iris_mm','right_iris_mm',
+     'tilt_ratio','quality','left_conf','right_conf',
+     ...algoHeaders
+    ].join(','),
   ];
-  const rows=S.trialData.map(d=>[
-    d.t_ms,d.elapsed_ms,d.phase,d.rep??'',trialType,d.flashColor||'',d.algos||algoList,
-    d.lPx?.toFixed(3)||'',d.rPx?.toFixed(3)||'',
-    d.lPupilMm?.toFixed(3)||'',d.rPupilMm?.toFixed(3)||'',
-    d.lIrisRad?.toFixed(3)||'',d.rIrisRad?.toFixed(3)||'',
-    d.lIrisMm?.toFixed(3)||'',d.rIrisMm?.toFixed(3)||'',
-    d.tilt?.toFixed(3)||'',d.q||'',
-    d.lConf!=null?d.lConf.toFixed(3):'',d.rConf!=null?d.rConf.toFixed(3):'',
-  ].join(','));
+
+  const rows=S.trialData.map(d=>{
+    const base=[
+      d.t_ms,d.elapsed_ms,d.phase,d.rep??'',trialType,d.flashColor||'',d.algos||algoList,
+      d.lPx?.toFixed(3)||'',d.rPx?.toFixed(3)||'',
+      d.lPupilMm?.toFixed(3)||'',d.rPupilMm?.toFixed(3)||'',
+      d.lIrisRad?.toFixed(3)||'',d.rIrisRad?.toFixed(3)||'',
+      d.lIrisMm?.toFixed(3)||'',d.rIrisMm?.toFixed(3)||'',
+      d.tilt?.toFixed(3)||'',d.q||'',
+      d.lConf!=null?d.lConf.toFixed(3):'',d.rConf!=null?d.rConf.toFixed(3):'',
+    ];
+    const algoVals=algoIds.flatMap(id=>{
+      const snap=d.algoSnap?.[id];
+      return [
+        snap?.lMm!=null?snap.lMm.toFixed(3):'',
+        snap?.lConf!=null?snap.lConf.toFixed(3):'',
+        snap?.failStage||'',
+      ];
+    });
+    return [...base,...algoVals].join(',');
+  });
+
   const csv=[...meta,...rows].join('\n');
   const blob=new Blob([csv],{type:'text/csv'});
   const url=URL.createObjectURL(blob);
@@ -1397,6 +1433,26 @@ $('exportBtn').onclick=()=>{
   a.download=`pupillens_v8_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
   document.body.appendChild(a);a.click();document.body.removeChild(a);
   setTimeout(()=>URL.revokeObjectURL(url),10000);
+};
+
+// ── Algo diagnostic log download ─────────────────────────────────────────────
+$('algoLogBtn').onclick=()=>{
+  let log=[];
+  try{log=JSON.parse(localStorage.getItem('pl_algo_log')||'[]');}catch(e){}
+  if(!log.length){toast('No algo log yet — run a trial first');return;}
+  const cols=['t','algo','side','failStage','conf','pupilMm','irisRad','failDetail'];
+  const csv=[
+    cols.join(','),
+    ...log.map(r=>cols.map(k=>{
+      if(k==='failDetail') return JSON.stringify(r[k]||'').replace(/,/g,';');
+      return r[k]??'';
+    }).join(','))
+  ].join('\n');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`algo_log_${new Date().toISOString().slice(0,16).replace('T','_')}.csv`;
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+  toast(`Algo log: ${log.length} rows`);
 };
 
 $('clearBtn').onclick=()=>{

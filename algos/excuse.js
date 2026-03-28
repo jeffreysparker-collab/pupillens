@@ -1,53 +1,19 @@
 /**
  * ExCuSe  —  Exclusion-Based Pupil Detection  (PupilExt port)
  * =============================================================
- * Reference: Fuhl et al., "ExCuSe: Robust Pupil Detection in Real-World
- *            Scenarios" (DAGM GCPR 2015)
+ * v2 — ambient RGB / webcam tuning (brightThr bug fixed, double blur, etc.)
+ * v2.1 — failStage diagnostic + maximally loose gates
  *
- * Core idea: rather than finding pupil edges directly, EXCLUDE all pixels
- * that are demonstrably NOT the pupil:
- *  1. Exclude bright pixels (corneal reflection / iris)
- *  2. Exclude edge-strong regions outside a plausible pupil zone
- *  3. What remains = candidate dark region
- *  4. Find the largest connected dark blob near the centre
- *  5. Fit ellipse to its convex hull points
+ * ExCuSe is architecturally the best fit for ambient RGB because it works
+ * from a dark-blob region rather than needing clean connected edges.  Gates
+ * have been widened aggressively here; noisy measurements should be filtered
+ * downstream with a Savitzky-Golay or median filter.
  *
- * Works well in high-glare conditions where Canny-based methods fail.
+ * Every return includes failStage: null on success, or a string:
+ *   "no_zone" | "no_cand_pixels" | "no_eroded_pixels" | "no_components" |
+ *   "no_component_near_centre" | "hull_lt6" | "aspect_or_size" | null
  *
- * ─── Changelog ────────────────────────────────────────────────────────────────
- * v2 — ambient RGB / webcam tuning
- *
- *  1. BUG: brightThr was computed but never applied to the candidate mask.
- *     The bright-exclusion step was a complete no-op.  Catchlights were
- *     included in cand[], survived dilation, and merged with the dark blob,
- *     pulling its centroid off-centre so the dist gate rejected it.
- *     Fix: apply brightThr exclusion in the cand[] build loop.
- *
- *  2. Double Gaussian blur before Sobel.
- *     Single pass leaves RGB sensor noise that fragments the dark blob's
- *     boundary, preventing the morphological close from bridging it into
- *     one connected component.
- *
- *  3. darkThr percentile: 40 → 30.
- *     p40 on a flat ambient-RGB histogram captures too many iris/limbal
- *     pixels alongside the pupil, creating oversized blobs that dwarf the
- *     pupil and win the size-based score.  p30 isolates the dark core better.
- *
- *  4. brightThr percentile: 75 → 70 (now actually applied, see fix 1).
- *     Lower threshold ensures the full catchlight region is excluded before
- *     dilation can bridge it into the dark blob.
- *
- *  5. Gradient exclusion radius: outerR*0.65 → outerR*0.75.
- *     At 0.65 the exclusion circle clips the pupil boundary on larger pupils
- *     or when the MediaPipe iris-centre estimate drifts.
- *
- *  6. Blob centroid distance gate: outerR*0.6 → outerR*0.65.
- *     Webcam gaze variation shifts the pupil centroid further from the
- *     MediaPipe iris estimate than the IR-calibrated 0.6 threshold allows.
- *
- *  7. Aspect ratio floor (final ellipse check): 0.25 → 0.20.
- *     Oblique angles produce squashed fits that 0.25 rejects needlessly.
- * ──────────────────────────────────────────────────────────────────────────────
+ * Log: if (result.failStage) console.log('ExCuSe:', result.failStage, result.failDetail);
  */
 (function(){
 'use strict';
@@ -69,40 +35,39 @@ window.PupilAlgos['excuse'] = {
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
     );
-    if (!zone.some(Boolean)) return fail();
+    if (!zone.some(Boolean)) return fail('no_zone');
 
-    // ── v2: Double Gaussian blur ──────────────────────────────────────────────
+    // Double blur
     const blurred  = new Float32Array(w * h);
     const blurred2 = new Float32Array(w * h);
     U.gaussianBlur5(gray,    blurred,  w, h, zone);
     U.gaussianBlur5(blurred, blurred2, w, h, zone);
 
-    // ── v2: percentiles on blurred2; brightThr now applied (was a bug) ────────
-    const darkThr   = U.percentile(blurred2, zone, 30);  // was 40
-    const brightThr = U.percentile(blurred2, zone, 70);  // was 75; now used
+    // Thresholds — loosened for ambient RGB
+    const darkThr   = U.percentile(blurred2, zone, 35);  // was 40 orig, 30 v2; 35 is middle ground
+    const brightThr = U.percentile(blurred2, zone, 70);  // applied now (was a bug: not applied at all)
 
     // Candidate mask: dark AND not a catchlight
-    // Previously only darkThr was tested; brightThr was computed but never
-    // applied, so catchlights were never excluded.
     const cand = new Uint8Array(w * h);
+    let candCount = 0;
     for (let i = 0; i < w * h; i++) {
       if (!zone[i]) continue;
-      if (blurred2[i] <= darkThr && blurred2[i] < brightThr) cand[i] = 1;
+      if (blurred2[i] <= darkThr && blurred2[i] < brightThr) { cand[i] = 1; candCount++; }
     }
+    if (candCount === 0) return fail('no_cand_pixels', { darkThr: darkThr.toFixed(1), brightThr: brightThr.toFixed(1) });
 
-    // Gradient exclusion: remove high-gradient pixels outside pupil zone
-    // ── v2: radius outerR*0.65 → outerR*0.75 to avoid clipping pupil boundary
+    // Gradient exclusion — widened to outerR*0.80 to avoid clipping pupil
     const { mag } = U.sobel(blurred2, w, h, zone);
     let maxG = 0;
     for (let i = 0; i < w * h; i++) maxG = Math.max(maxG, mag[i]);
     const edgeThr = maxG * 0.25;
     for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
       if (!cand[y * w + x]) continue;
-      const r = Math.hypot(x - cx, y - cy);
-      if (r > outerR * 0.75 && mag[y * w + x] > edgeThr) cand[y * w + x] = 0; // was 0.65
+      if (Math.hypot(x - cx, y - cy) > outerR * 0.80 && mag[y * w + x] > edgeThr)
+        cand[y * w + x] = 0;
     }
 
-    // Morphological close (5×5 dilate then 5×5 erode) to fill holes
+    // Morphological close
     const closed = new Uint8Array(w * h);
     for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
       if (!cand[y * w + x]) continue;
@@ -112,15 +77,17 @@ window.PupilAlgos['excuse'] = {
       }
     }
     const eroded = new Uint8Array(w * h);
+    let erodedCount = 0;
     for (let y = 2; y < h - 2; y++) for (let x = 2; x < w - 2; x++) {
       if (!closed[y * w + x]) continue;
       let all = true;
       for (let dy = -2; dy <= 2 && all; dy++) for (let dx = -2; dx <= 2; dx++)
         if (!closed[(y + dy) * w + (x + dx)]) { all = false; break; }
-      if (all) eroded[y * w + x] = 1;
+      if (all) { eroded[y * w + x] = 1; erodedCount++; }
     }
+    if (erodedCount === 0) return fail('no_eroded_pixels', { candCount });
 
-    // Connected components on eroded mask
+    // Connected components
     const label = new Int16Array(w * h);
     let nlbls = 0;
     const compSz = [], compSx = [], compSy = [], compPts = [];
@@ -141,24 +108,24 @@ window.PupilAlgos['excuse'] = {
       }
       compSz.push(cnt); compSx.push(sx); compSy.push(sy); compPts.push(pts);
     }
+    if (!nlbls) return fail('no_components', { erodedCount });
 
-    if (!nlbls) return fail();
-
-    // Score: large blobs near centre
-    // ── v2: distance gate outerR*0.6 → outerR*0.65
+    // Score — distance gate widened to outerR*0.75
     let best = null, bestScore = -1;
+    const compDetails = [];
     for (let l = 0; l < nlbls; l++) {
       const mx = compSx[l] / compSz[l], my = compSy[l] / compSz[l];
-      const dist = Math.hypot(mx - cx, my - cy);
-      if (dist > outerR * 0.65) continue;                            // was 0.6
+      const dist  = Math.hypot(mx - cx, my - cy);
       const areaR = Math.sqrt(compSz[l] / Math.PI);
-      if (areaR < innerR * 0.5 || areaR > outerR) continue;
+      compDetails.push({ dist: dist.toFixed(1), areaR: areaR.toFixed(1), sz: compSz[l] });
+      if (dist > outerR * 0.75) continue;                             // was 0.6
+      if (areaR < innerR * 0.4 || areaR > outerR * 1.1) continue;    // loosened bounds
       const score = compSz[l] / (dist + 1);
       if (score > bestScore) { bestScore = score; best = l; }
     }
-    if (best === null) return fail();
+    if (best === null) return fail('no_component_near_centre',
+      { nlbls, outerR: outerR.toFixed(1), innerR: innerR.toFixed(1), compDetails });
 
-    // Convex-hull approximation: furthest point per angular sector
     const mx = compSx[best] / compSz[best], my = compSy[best] / compSz[best];
     const SECTORS = 36;
     const buckets = Array.from({ length: SECTORS }, () => null);
@@ -169,26 +136,31 @@ window.PupilAlgos['excuse'] = {
       if (!buckets[si] || d > buckets[si].d) buckets[si] = { x: px, y: py, d };
     }
     const hull = buckets.filter(Boolean).map(b => [b.x, b.y]);
-    if (hull.length < 6) return fail();
+    if (hull.length < 6) return fail('hull_lt6', { hullLen: hull.length, compSz: compSz[best] });
 
     const el = U.fitEllipse(hull);
     if (!el) {
-      // Fallback: circular estimate from area
+      // Circular fallback — always return something
       const r    = Math.sqrt(compSz[best] / Math.PI);
-      const conf = Math.max(0, 0.4 - Math.hypot(mx - cx, my - cy) / (outerR + 1));
+      const conf = Math.max(0, 0.35 - Math.hypot(mx - cx, my - cy) / (outerR + 1));
       const dbg  = buildDebug(w, h, zone, blurred2, eroded, best, label, mx, my, r, null);
-      return { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf, debugPixels: dbg };
+      return { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
+               debugPixels: dbg, failStage: null };
     }
 
     const { a, b: bEl, cx: ex, cy: ey } = el;
     const pupilR = (a + bEl) / 2;
     const aspect = bEl / (a + 1e-6);
-    if (aspect < 0.20 || pupilR < innerR || pupilR > outerR) return fail(); // was 0.25
+    // Aspect floor dropped to 0.15 — let SG filter handle noisy frames
+    if (aspect < 0.15 || pupilR < innerR * 0.5 || pupilR > outerR * 1.1)
+      return fail('aspect_or_size', { aspect: aspect.toFixed(2), pupilR: pupilR.toFixed(1), innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) });
+
     const dist2 = Math.hypot(ex - cx, ey - cy);
-    const conf  = Math.min(1, aspect) * Math.max(0, 1 - dist2 / (outerR * 0.65));
+    const conf  = Math.min(1, aspect) * Math.max(0, 1 - dist2 / (outerR * 0.75));
 
     const dbg = buildDebug(w, h, zone, blurred2, eroded, best, label, ex, ey, pupilR, hull);
-    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf, debugPixels: dbg };
+    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
+             debugPixels: dbg, failStage: null };
   }
 };
 
@@ -213,6 +185,9 @@ function buildDebug(w, h, zone, blurred2, eroded, bestLbl, label, cx, cy, r, hul
   return dbg;
 }
 
-function fail() { return { pupilRadPx: null, pupilMm: null, confidence: 0, debugPixels: null }; }
+function fail(stage, detail = {}) {
+  return { pupilRadPx: null, pupilMm: null, confidence: 0,
+           debugPixels: null, failStage: stage, failDetail: detail };
+}
 
 })();

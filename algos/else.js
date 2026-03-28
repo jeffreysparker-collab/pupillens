@@ -1,48 +1,17 @@
 /**
  * ElSe  —  Ellipse Selection  (PupilExt port)
  * ============================================
- * Reference: Fuhl et al., "ElSe: Ellipse Selection for Robust Pupil Detection
- *            in Real-World Environments" (ETRA 2016)
+ * v2 — ambient RGB / webcam tuning (see else.js changelog)
+ * v2.1 — added failStage diagnostic to return object
  *
- * Key steps:
- *  1. Greyscale crop → histogram equalisation
- *  2. Specular flood-fill (patch corneal reflections before edge detection)
- *  3. Double Gaussian blur → Sobel → NMS → Canny → thin
- *  4. Connected-component contour extraction
- *  5. Fit ellipse to each contour ≥ 6 pts
- *  6. Rank candidates by aspect ratio, centroid proximity, size
- *  7. Best candidate → pupil estimate
+ * Every return now includes failStage: null on success, or a string
+ * describing exactly where the algo gave up, e.g.:
+ *   "no_zone" | "eq_empty" | "no_contours_after_canny" |
+ *   "no_contour_ge6" | "all_filtered_size" | "all_filtered_dist" |
+ *   "all_filtered_aspect" | "fitEllipse_all_null" | null
  *
- * ─── Changelog ────────────────────────────────────────────────────────────────
- * v2 — ambient RGB / webcam tuning
- *
- *  1. Specular flood-fill added (ported from starburst).
- *     Corneal catchlights on RGB cameras land in the pupil zone and produce
- *     strong false contours that outscore the real pupil boundary.  Seeding a
- *     flood-fill from p90 pixels and replacing them with the zone mean removes
- *     them before any edge detection runs.
- *
- *  2. Double Gaussian blur before Sobel.
- *     A single gaussianBlur5 pass leaves enough RGB sensor noise to fragment
- *     the pupil-boundary edge into many short disconnected components, none of
- *     which survive the ≥6-point ellipse fit.  A second pass suppresses this
- *     without meaningfully smearing the pupil edge location.
- *
- *  3. innerDarker threshold: 5 → 1.5.
- *     The original 5-unit gap is calibrated for IR illumination.  On ambient
- *     RGB the pupil/iris contrast is much lower; the threshold almost never
- *     triggers, locking maxDist to the tight irisRad*0.35 fallback every frame
- *     and rejecting every valid fit.
- *
- *  4. maxDist fallback: irisRad*0.35 → irisRad*0.50.
- *     Webcam gaze variation and slight head angle shift the MediaPipe
- *     iris-centre estimate away from the true pupil centroid further than
- *     0.35 allows.  0.50 matches real-world drift without accepting lid edges.
- *
- *  5. Aspect ratio floor: 0.3 → 0.2.
- *     Oblique camera angles produce slightly squashed ellipses that 0.3
- *     rejects unnecessarily.
- * ──────────────────────────────────────────────────────────────────────────────
+ * Log this in your detection loop:
+ *   if (result.failStage) console.log('ElSe fail:', result.failStage, result.failDetail);
  */
 (function(){
 'use strict';
@@ -64,27 +33,27 @@ window.PupilAlgos['else'] = {
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
     );
-    if (!zone.some(Boolean)) return fail();
+    if (!zone.some(Boolean)) return fail('no_zone');
 
-    // Histogram equalisation within zone
+    // Histogram equalisation
     const hist = new Float32Array(256);
     let zCnt = 0;
     for (let i = 0; i < gray.length; i++)
       if (zone[i]) { hist[Math.floor(gray[i])]++; zCnt++; }
-    if (zCnt < 20) return fail();
+    if (zCnt < 20) return fail('eq_empty', { zCnt });
     let cumul = 0;
     const lut = new Float32Array(256);
     for (let i = 0; i < 256; i++) { cumul += hist[i]; lut[i] = (cumul / zCnt) * 255; }
     const eq = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) if (zone[i]) eq[i] = lut[Math.floor(gray[i])];
 
-    // ── v2: Specular flood-fill ───────────────────────────────────────────────
+    // Specular flood-fill
     const zv = [];
     for (let i = 0; i < w * h; i++) if (zone[i]) zv.push(eq[i]);
     zv.sort((a, b) => a - b);
     const zmean = zv.reduce((s, v) => s + v, 0) / zv.length;
-    const p90   = zv[Math.floor(zv.length * 0.90)];
-    const p80   = zv[Math.floor(zv.length * 0.80)];
+    const p90 = zv[Math.floor(zv.length * 0.90)];
+    const p80 = zv[Math.floor(zv.length * 0.80)];
     const masked   = new Float32Array(eq);
     const specFill = new Uint8Array(w * h);
     const sfStk = [];
@@ -102,7 +71,7 @@ window.PupilAlgos['else'] = {
       }
     }
 
-    // ── v2: Double Gaussian → Sobel → NMS → Canny → thin ─────────────────────
+    // Double blur → edges
     const blurred  = new Float32Array(w * h);
     const blurred2 = new Float32Array(w * h);
     U.gaussianBlur5(masked,  blurred,  w, h, zone);
@@ -112,7 +81,9 @@ window.PupilAlgos['else'] = {
     let   edges  = U.canny(nmsMap, mag, w, h);
     edges          = U.thin(edges, w, h);
 
-    // Connected-component contour extraction
+    const edgePxCount = edges.reduce((s, v) => s + v, 0);
+
+    // Connected components
     const label    = new Int16Array(w * h);
     const contours = [];
     let nlbls = 0;
@@ -134,7 +105,11 @@ window.PupilAlgos['else'] = {
       contours.push(pts);
     }
 
-    // ── v2: photometric hint on blurred2; threshold 5 → 1.5 ──────────────────
+    if (contours.length === 0) return fail('no_contours_after_canny', { edgePxCount });
+    const ge6 = contours.filter(p => p.length >= 6);
+    if (ge6.length === 0) return fail('no_contour_ge6', { contourCount: contours.length, maxContourLen: Math.max(...contours.map(p=>p.length)) });
+
+    // Photometric hint
     const ir2 = (outerR * 0.5) ** 2;
     let iS = 0, iC = 0, oS = 0, oC = 0;
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -143,26 +118,35 @@ window.PupilAlgos['else'] = {
       if (r2 < ir2)               { iS += blurred2[y * w + x]; iC++; }
       else if (r2 <= outerR ** 2) { oS += blurred2[y * w + x]; oC++; }
     }
-    const innerDarker = (iC && oC) && iS / iC < oS / oC - 1.5; // was 5
+    const innerDarker = (iC && oC) && iS / iC < oS / oC - 1.5;
 
-    // Fit + score each contour
+    // Fit + score
     let best = null, bestScore = -1;
+    let nFitAttempts = 0, nFitNull = 0, nFailSize = 0, nFailDist = 0, nFailAspect = 0;
     for (const pts of contours) {
       if (pts.length < 6) continue;
+      nFitAttempts++;
       const el = U.fitEllipse(pts);
-      if (!el) continue;
+      if (!el) { nFitNull++; continue; }
       const { cx: ex, cy: ey, a, b } = el;
-      if (a < innerR || a > outerR) continue;
+      if (a < innerR || a > outerR) { nFailSize++; continue; }
       const aspect  = b / (a + 1e-6);
-      if (aspect < 0.2) continue;                                    // was 0.3
+      if (aspect < 0.2) { nFailAspect++; continue; }
       const dist    = Math.hypot(ex - cx, ey - cy);
-      const maxDist = innerDarker ? irisRad * 0.55 : irisRad * 0.50; // was 0.35
-      if (dist > maxDist) continue;
+      const maxDist = innerDarker ? irisRad * 0.55 : irisRad * 0.50;
+      if (dist > maxDist) { nFailDist++; continue; }
       const score = aspect * (1 - dist / (maxDist + 1)) * Math.log(pts.length + 1);
       if (score > bestScore) { bestScore = score; best = { el, pts }; }
     }
 
-    if (!best) return fail();
+    if (!best) {
+      const detail = { nFitAttempts, nFitNull, nFailSize, nFailDist, nFailAspect,
+                       innerDarker, irisRad: irisRad.toFixed(1), innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) };
+      if (nFitNull === nFitAttempts) return fail('fitEllipse_all_null', detail);
+      if (nFailSize > 0 && nFailDist === 0 && nFailAspect === 0) return fail('all_filtered_size', detail);
+      if (nFailDist > 0 && nFailSize === 0) return fail('all_filtered_dist', detail);
+      return fail('all_filtered_mixed', detail);
+    }
 
     const { a, b, cx: ex, cy: ey } = best.el;
     const pupilR = (a + b) / 2;
@@ -170,7 +154,6 @@ window.PupilAlgos['else'] = {
     const dist   = Math.hypot(ex - cx, ey - cy);
     const conf   = Math.min(1, aspect) * Math.max(0, 1 - dist / (irisRad * 0.6));
 
-    // Debug
     const dbg = U.makeDebugRGBA(w, h);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       const i = y * w + x, idx = i * 4;
@@ -186,10 +169,14 @@ window.PupilAlgos['else'] = {
     }
     U.drawCircle(dbg, w, h, ex, ey, pupilR, [0, 255, 220, 220]);
 
-    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf, debugPixels: dbg };
+    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
+             debugPixels: dbg, failStage: null };
   }
 };
 
-function fail() { return { pupilRadPx: null, pupilMm: null, confidence: 0, debugPixels: null }; }
+function fail(stage, detail={}) {
+  return { pupilRadPx: null, pupilMm: null, confidence: 0,
+           debugPixels: null, failStage: stage, failDetail: detail };
+}
 
 })();

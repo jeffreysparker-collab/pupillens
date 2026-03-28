@@ -28,8 +28,8 @@ window.PupilAlgos['else'] = {
     const { width: w, height: h } = imageData;
 
     const mmToPx = irisRad / 5.85;
-    const outerR = 4.0 * mmToPx;
-    const innerR = 1.0 * mmToPx;
+    const outerR = 4.0 * mmToPx;  // tight: excludes limbus (~5.85x), only passes pupil contours
+    const innerR = 0.4 * mmToPx;  // lowered from 1.0 — allows small pupils in bright light
 
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
@@ -72,11 +72,12 @@ window.PupilAlgos['else'] = {
       }
     }
 
-    // Double blur → edges
+    // Blur — single pass only for now (double blur eats pupil edge on small crops)
     const blurred  = new Float32Array(w * h);
     const blurred2 = new Float32Array(w * h);
-    U.gaussianBlur5(masked,  blurred,  w, h, zone);
-    U.gaussianBlur5(blurred, blurred2, w, h, zone);
+    U.gaussianBlur5(masked, blurred, w, h, zone);
+    // U.gaussianBlur5(blurred, blurred2, w, h, zone);  // TODO: re-enable if noise is a problem
+    blurred2.set(blurred);
     const { mag, ang } = U.sobel(blurred2, w, h, zone);
     const nmsMap = U.nms(mag, ang, w, h, zone);
     let   edges  = U.canny(nmsMap, mag, w, h);
@@ -127,13 +128,15 @@ window.PupilAlgos['else'] = {
     // Fit + score
     let best = null, bestScore = -1;
     let nFitAttempts = 0, nFitNull = 0, nFailSize = 0, nFailDist = 0, nFailAspect = 0;
+    const failSizeAs = [];  // collect rejected 'a' values for diagnostics
     for (const pts of contours) {
       if (pts.length < 6) continue;
       nFitAttempts++;
       const el = U.fitEllipse(pts);
       if (!el) { nFitNull++; continue; }
       const { cx: ex, cy: ey, a, b } = el;
-      if (a < innerR || a > outerR) { nFailSize++; continue; }
+      // Gate: innerR..outerR already sized for real pupil range at this camera distance
+      if (a < innerR || a > outerR) { nFailSize++; failSizeAs.push(+a.toFixed(1)); continue; }
       const aspect  = b / (a + 1e-6);
       if (aspect < 0.2) { nFailAspect++; continue; }
       const dist    = Math.hypot(ex - cx, ey - cy);
@@ -145,6 +148,7 @@ window.PupilAlgos['else'] = {
 
     if (!best) {
       const detail = { nFitAttempts, nFitNull, nFailSize, nFailDist, nFailAspect,
+                       failSizeAs: failSizeAs.slice(0, 8),
                        innerDarker, irisRad: irisRad.toFixed(1),
                        innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) };
       if (nFitNull === nFitAttempts) return _fail('else', inp, 'fitEllipse_all_null', detail);

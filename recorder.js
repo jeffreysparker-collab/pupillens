@@ -8,8 +8,8 @@
  *   const rec = new IrisClipRecorder({ cellSize: 120, fps: 30 });
  *   rec.start();                         // begins recording
  *   rec.writeFrame(video, mL, mR);       // call each detection frame
- *   const blob = await rec.stop();       // returns WebM/MP4 blob
- *   rec.download(blob, 'iris_clip.webm');
+ *   const blob = await rec.stop();       // returns MP4/WebM blob
+ *   rec.download(blob);                  // auto-names with correct extension
  *
  * writeFrame inputs:
  *   video  : HTMLVideoElement
@@ -32,6 +32,7 @@ class IrisClipRecorder {
     this._running  = false;
     this._startMs  = 0;
     this._frameN   = 0;
+    this._mimeType = '';
   }
 
   /** Start recording. Returns true if MediaRecorder is available. */
@@ -57,16 +58,22 @@ class IrisClipRecorder {
       return false;
     }
 
-    // Prefer VP9 → VP8 → default
+    // Safari/iOS requires MP4+H.264 — must be checked first.
+    // Chrome/Firefox prefer WebM VP9/VP8.
     const mimeTypes = [
+      'video/mp4;codecs=avc1',   // Safari iOS/macOS
+      'video/mp4;codecs=h264',   // some Android Chrome
+      'video/mp4',               // generic MP4 fallback
       'video/webm;codecs=vp9',
       'video/webm;codecs=vp8',
       'video/webm',
-      'video/mp4',
     ];
-    const mime = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+    this._mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
 
-    this._recorder = new MediaRecorder(this._stream, mime ? { mimeType: mime } : {});
+    this._recorder = new MediaRecorder(
+      this._stream,
+      this._mimeType ? { mimeType: this._mimeType } : {}
+    );
     this._chunks   = [];
     this._recorder.ondataavailable = e => { if (e.data.size) this._chunks.push(e.data); };
 
@@ -190,7 +197,9 @@ class IrisClipRecorder {
     this._running = false;
     return new Promise(resolve => {
       this._recorder.onstop = () => {
-        const mime = this._recorder.mimeType || 'video/webm';
+        // Use the mime type we negotiated at start() time; fall back to
+        // whatever the recorder reports if that's somehow different.
+        const mime = this._mimeType || this._recorder.mimeType || 'video/webm';
         const blob = new Blob(this._chunks, { type: mime });
         this._chunks = [];
         resolve(blob);
@@ -200,18 +209,28 @@ class IrisClipRecorder {
     });
   }
 
-  /** Trigger browser download of a recorded blob */
-  download(blob, filename='iris_clip.webm') {
+  /**
+   * Trigger browser download of a recorded blob.
+   * Extension is inferred from the blob mime type automatically.
+   *
+   * @param {Blob}   blob
+   * @param {string} [basename]  filename without extension (default: 'iris_clip')
+   */
+  download(blob, basename='iris_clip') {
     if (!blob) return;
+    const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
     const url = URL.createObjectURL(blob);
     const a   = document.createElement('a');
     a.href     = url;
-    a.download = filename;
+    a.download = `${basename}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
+
+  /** Mime type negotiated for the current/last recording (e.g. 'video/mp4;codecs=avc1') */
+  get mimeType() { return this._mimeType; }
 
   /** Duration of current/last recording in seconds */
   get durationSec() { return (Date.now() - this._startMs) / 1000; }

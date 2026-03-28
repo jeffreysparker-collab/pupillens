@@ -3,6 +3,7 @@
  * ============================================
  * v2 — ambient RGB / webcam tuning (see else.js changelog)
  * v2.1 — added failStage diagnostic to return object
+ * v2.2 — silent localStorage diagnostic logger (_silentLog)
  *
  * Every return now includes failStage: null on success, or a string
  * describing exactly where the algo gave up, e.g.:
@@ -10,8 +11,8 @@
  *   "no_contour_ge6" | "all_filtered_size" | "all_filtered_dist" |
  *   "all_filtered_aspect" | "fitEllipse_all_null" | null
  *
- * Log this in your detection loop:
- *   if (result.failStage) console.log('ElSe fail:', result.failStage, result.failDetail);
+ * Diagnostic log: written to localStorage key 'pl_algo_log' only during trials
+ * (when window._plTrialActive === true). Download via the Algo Log button in app.
  */
 (function(){
 'use strict';
@@ -33,14 +34,14 @@ window.PupilAlgos['else'] = {
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
     );
-    if (!zone.some(Boolean)) return fail('no_zone');
+    if (!zone.some(Boolean)) return _fail('else', inp, 'no_zone');
 
     // Histogram equalisation
     const hist = new Float32Array(256);
     let zCnt = 0;
     for (let i = 0; i < gray.length; i++)
       if (zone[i]) { hist[Math.floor(gray[i])]++; zCnt++; }
-    if (zCnt < 20) return fail('eq_empty', { zCnt });
+    if (zCnt < 20) return _fail('else', inp, 'eq_empty', { zCnt });
     let cumul = 0;
     const lut = new Float32Array(256);
     for (let i = 0; i < 256; i++) { cumul += hist[i]; lut[i] = (cumul / zCnt) * 255; }
@@ -105,9 +106,12 @@ window.PupilAlgos['else'] = {
       contours.push(pts);
     }
 
-    if (contours.length === 0) return fail('no_contours_after_canny', { edgePxCount });
+    if (contours.length === 0) return _fail('else', inp, 'no_contours_after_canny', { edgePxCount });
     const ge6 = contours.filter(p => p.length >= 6);
-    if (ge6.length === 0) return fail('no_contour_ge6', { contourCount: contours.length, maxContourLen: Math.max(...contours.map(p=>p.length)) });
+    if (ge6.length === 0) return _fail('else', inp, 'no_contour_ge6', {
+      contourCount: contours.length,
+      maxContourLen: Math.max(...contours.map(p=>p.length))
+    });
 
     // Photometric hint
     const ir2 = (outerR * 0.5) ** 2;
@@ -141,11 +145,12 @@ window.PupilAlgos['else'] = {
 
     if (!best) {
       const detail = { nFitAttempts, nFitNull, nFailSize, nFailDist, nFailAspect,
-                       innerDarker, irisRad: irisRad.toFixed(1), innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) };
-      if (nFitNull === nFitAttempts) return fail('fitEllipse_all_null', detail);
-      if (nFailSize > 0 && nFailDist === 0 && nFailAspect === 0) return fail('all_filtered_size', detail);
-      if (nFailDist > 0 && nFailSize === 0) return fail('all_filtered_dist', detail);
-      return fail('all_filtered_mixed', detail);
+                       innerDarker, irisRad: irisRad.toFixed(1),
+                       innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) };
+      if (nFitNull === nFitAttempts) return _fail('else', inp, 'fitEllipse_all_null', detail);
+      if (nFailSize > 0 && nFailDist === 0 && nFailAspect === 0) return _fail('else', inp, 'all_filtered_size', detail);
+      if (nFailDist > 0 && nFailSize === 0) return _fail('else', inp, 'all_filtered_dist', detail);
+      return _fail('else', inp, 'all_filtered_mixed', detail);
     }
 
     const { a, b, cx: ex, cy: ey } = best.el;
@@ -169,14 +174,40 @@ window.PupilAlgos['else'] = {
     }
     U.drawCircle(dbg, w, h, ex, ey, pupilR, [0, 255, 220, 220]);
 
-    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
-             debugPixels: dbg, failStage: null };
+    const out = { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
+                  debugPixels: dbg, failStage: null };
+    _silentLog('else', inp, out);
+    return out;
   }
 };
 
-function fail(stage, detail={}) {
-  return { pupilRadPx: null, pupilMm: null, confidence: 0,
-           debugPixels: null, failStage: stage, failDetail: detail };
+// ── Diagnostic helpers ────────────────────────────────────────────────────────
+
+function _fail(algoId, inp, stage, detail = {}) {
+  const out = { pupilRadPx: null, pupilMm: null, confidence: 0,
+                debugPixels: null, failStage: stage, failDetail: detail };
+  _silentLog(algoId, inp, out);
+  return out;
+}
+
+function _silentLog(algoId, inp, result) {
+  try {
+    if (!window._plTrialActive) return;
+    const row = {
+      t:          Date.now(),
+      algo:       algoId,
+      side:       inp._side || '?',
+      failStage:  result.failStage || null,
+      failDetail: result.failDetail || null,
+      conf:       result.confidence ?? null,
+      pupilMm:    result.pupilMm   ?? null,
+      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
+    };
+    const log = JSON.parse(localStorage.getItem('pl_algo_log') || '[]');
+    log.push(row);
+    if (log.length > 2000) log.splice(0, log.length - 2000);
+    localStorage.setItem('pl_algo_log', JSON.stringify(log));
+  } catch(e) { /* never throw */ }
 }
 
 })();

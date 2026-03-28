@@ -3,6 +3,7 @@
  * =============================================================
  * v2 — ambient RGB / webcam tuning (brightThr bug fixed, double blur, etc.)
  * v2.1 — failStage diagnostic + maximally loose gates
+ * v2.2 — silent localStorage diagnostic logger (_silentLog)
  *
  * ExCuSe is architecturally the best fit for ambient RGB because it works
  * from a dark-blob region rather than needing clean connected edges.  Gates
@@ -13,7 +14,8 @@
  *   "no_zone" | "no_cand_pixels" | "no_eroded_pixels" | "no_components" |
  *   "no_component_near_centre" | "hull_lt6" | "aspect_or_size" | null
  *
- * Log: if (result.failStage) console.log('ExCuSe:', result.failStage, result.failDetail);
+ * Diagnostic log: written to localStorage key 'pl_algo_log' only during trials
+ * (when window._plTrialActive === true). Download via the Algo Log button in app.
  */
 (function(){
 'use strict';
@@ -35,7 +37,7 @@ window.PupilAlgos['excuse'] = {
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
     );
-    if (!zone.some(Boolean)) return fail('no_zone');
+    if (!zone.some(Boolean)) return _fail('excuse', inp, 'no_zone');
 
     // Double blur
     const blurred  = new Float32Array(w * h);
@@ -44,8 +46,8 @@ window.PupilAlgos['excuse'] = {
     U.gaussianBlur5(blurred, blurred2, w, h, zone);
 
     // Thresholds — loosened for ambient RGB
-    const darkThr   = U.percentile(blurred2, zone, 35);  // was 40 orig, 30 v2; 35 is middle ground
-    const brightThr = U.percentile(blurred2, zone, 70);  // applied now (was a bug: not applied at all)
+    const darkThr   = U.percentile(blurred2, zone, 35);
+    const brightThr = U.percentile(blurred2, zone, 70);
 
     // Candidate mask: dark AND not a catchlight
     const cand = new Uint8Array(w * h);
@@ -54,9 +56,11 @@ window.PupilAlgos['excuse'] = {
       if (!zone[i]) continue;
       if (blurred2[i] <= darkThr && blurred2[i] < brightThr) { cand[i] = 1; candCount++; }
     }
-    if (candCount === 0) return fail('no_cand_pixels', { darkThr: darkThr.toFixed(1), brightThr: brightThr.toFixed(1) });
+    if (candCount === 0) return _fail('excuse', inp, 'no_cand_pixels', {
+      darkThr: darkThr.toFixed(1), brightThr: brightThr.toFixed(1)
+    });
 
-    // Gradient exclusion — widened to outerR*0.80 to avoid clipping pupil
+    // Gradient exclusion
     const { mag } = U.sobel(blurred2, w, h, zone);
     let maxG = 0;
     for (let i = 0; i < w * h; i++) maxG = Math.max(maxG, mag[i]);
@@ -85,7 +89,7 @@ window.PupilAlgos['excuse'] = {
         if (!closed[(y + dy) * w + (x + dx)]) { all = false; break; }
       if (all) { eroded[y * w + x] = 1; erodedCount++; }
     }
-    if (erodedCount === 0) return fail('no_eroded_pixels', { candCount });
+    if (erodedCount === 0) return _fail('excuse', inp, 'no_eroded_pixels', { candCount });
 
     // Connected components
     const label = new Int16Array(w * h);
@@ -108,7 +112,7 @@ window.PupilAlgos['excuse'] = {
       }
       compSz.push(cnt); compSx.push(sx); compSy.push(sy); compPts.push(pts);
     }
-    if (!nlbls) return fail('no_components', { erodedCount });
+    if (!nlbls) return _fail('excuse', inp, 'no_components', { erodedCount });
 
     // Score — distance gate widened to outerR*0.75
     let best = null, bestScore = -1;
@@ -118,12 +122,12 @@ window.PupilAlgos['excuse'] = {
       const dist  = Math.hypot(mx - cx, my - cy);
       const areaR = Math.sqrt(compSz[l] / Math.PI);
       compDetails.push({ dist: dist.toFixed(1), areaR: areaR.toFixed(1), sz: compSz[l] });
-      if (dist > outerR * 0.75) continue;                             // was 0.6
-      if (areaR < innerR * 0.4 || areaR > outerR * 1.1) continue;    // loosened bounds
+      if (dist > outerR * 0.75) continue;
+      if (areaR < innerR * 0.4 || areaR > outerR * 1.1) continue;
       const score = compSz[l] / (dist + 1);
       if (score > bestScore) { bestScore = score; best = l; }
     }
-    if (best === null) return fail('no_component_near_centre',
+    if (best === null) return _fail('excuse', inp, 'no_component_near_centre',
       { nlbls, outerR: outerR.toFixed(1), innerR: innerR.toFixed(1), compDetails });
 
     const mx = compSx[best] / compSz[best], my = compSy[best] / compSz[best];
@@ -136,7 +140,9 @@ window.PupilAlgos['excuse'] = {
       if (!buckets[si] || d > buckets[si].d) buckets[si] = { x: px, y: py, d };
     }
     const hull = buckets.filter(Boolean).map(b => [b.x, b.y]);
-    if (hull.length < 6) return fail('hull_lt6', { hullLen: hull.length, compSz: compSz[best] });
+    if (hull.length < 6) return _fail('excuse', inp, 'hull_lt6', {
+      hullLen: hull.length, compSz: compSz[best]
+    });
 
     const el = U.fitEllipse(hull);
     if (!el) {
@@ -144,23 +150,29 @@ window.PupilAlgos['excuse'] = {
       const r    = Math.sqrt(compSz[best] / Math.PI);
       const conf = Math.max(0, 0.35 - Math.hypot(mx - cx, my - cy) / (outerR + 1));
       const dbg  = buildDebug(w, h, zone, blurred2, eroded, best, label, mx, my, r, null);
-      return { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
-               debugPixels: dbg, failStage: null };
+      const out  = { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
+                     debugPixels: dbg, failStage: null };
+      _silentLog('excuse', inp, out);
+      return out;
     }
 
     const { a, b: bEl, cx: ex, cy: ey } = el;
     const pupilR = (a + bEl) / 2;
     const aspect = bEl / (a + 1e-6);
-    // Aspect floor dropped to 0.15 — let SG filter handle noisy frames
     if (aspect < 0.15 || pupilR < innerR * 0.5 || pupilR > outerR * 1.1)
-      return fail('aspect_or_size', { aspect: aspect.toFixed(2), pupilR: pupilR.toFixed(1), innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) });
+      return _fail('excuse', inp, 'aspect_or_size', {
+        aspect: aspect.toFixed(2), pupilR: pupilR.toFixed(1),
+        innerR: innerR.toFixed(1), outerR: outerR.toFixed(1)
+      });
 
     const dist2 = Math.hypot(ex - cx, ey - cy);
     const conf  = Math.min(1, aspect) * Math.max(0, 1 - dist2 / (outerR * 0.75));
 
     const dbg = buildDebug(w, h, zone, blurred2, eroded, best, label, ex, ey, pupilR, hull);
-    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
-             debugPixels: dbg, failStage: null };
+    const out = { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
+                  debugPixels: dbg, failStage: null };
+    _silentLog('excuse', inp, out);
+    return out;
   }
 };
 
@@ -185,9 +197,33 @@ function buildDebug(w, h, zone, blurred2, eroded, bestLbl, label, cx, cy, r, hul
   return dbg;
 }
 
-function fail(stage, detail = {}) {
-  return { pupilRadPx: null, pupilMm: null, confidence: 0,
-           debugPixels: null, failStage: stage, failDetail: detail };
+// ── Diagnostic helpers ────────────────────────────────────────────────────────
+
+function _fail(algoId, inp, stage, detail = {}) {
+  const out = { pupilRadPx: null, pupilMm: null, confidence: 0,
+                debugPixels: null, failStage: stage, failDetail: detail };
+  _silentLog(algoId, inp, out);
+  return out;
+}
+
+function _silentLog(algoId, inp, result) {
+  try {
+    if (!window._plTrialActive) return;
+    const row = {
+      t:          Date.now(),
+      algo:       algoId,
+      side:       inp._side || '?',
+      failStage:  result.failStage || null,
+      failDetail: result.failDetail || null,
+      conf:       result.confidence ?? null,
+      pupilMm:    result.pupilMm   ?? null,
+      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
+    };
+    const log = JSON.parse(localStorage.getItem('pl_algo_log') || '[]');
+    log.push(row);
+    if (log.length > 2000) log.splice(0, log.length - 2000);
+    localStorage.setItem('pl_algo_log', JSON.stringify(log));
+  } catch(e) { /* never throw */ }
 }
 
 })();

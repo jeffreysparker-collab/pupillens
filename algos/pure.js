@@ -3,12 +3,14 @@
  * ===========================================================
  * v2 — ambient RGB / webcam tuning (curvature fix, spec fill, double blur etc.)
  * v2.1 — failStage diagnostic
+ * v2.2 — silent localStorage diagnostic logger (_silentLog)
  *
  * Every return includes failStage: null on success, or a string:
  *   "no_zone" | "no_edges" | "no_segments_ge_minseg" | "no_arc_segs" |
  *   "no_merged_ge6" | "no_valid_ellipse" | null
  *
- * Log: if (result.failStage) console.log('PuRe:', result.failStage, result.failDetail);
+ * Diagnostic log: written to localStorage key 'pl_algo_log' only during trials
+ * (when window._plTrialActive === true). Download via the Algo Log button in app.
  */
 (function(){
 'use strict';
@@ -33,12 +35,12 @@ window.PupilAlgos['pure'] = {
     const { gray, zone } = U.extractGray(
       imageData, cx, cy, outerR, 0, upperLidY, lowerLidY, 4
     );
-    if (!zone.some(Boolean)) return fail('no_zone');
+    if (!zone.some(Boolean)) return _fail('pure', inp, 'no_zone');
 
     // p1-p99 stretch
     const vals = [];
     for (let i = 0; i < gray.length; i++) if (zone[i]) vals.push(gray[i]);
-    if (vals.length < 20) return fail('no_zone');
+    if (vals.length < 20) return _fail('pure', inp, 'no_zone');
     vals.sort((a, b) => a - b);
     const lo = vals[Math.floor(vals.length * 0.01)] || 0;
     const hi = vals[Math.floor(vals.length * 0.99)] || 255;
@@ -82,7 +84,7 @@ window.PupilAlgos['pure'] = {
     edges          = U.thin(edges, w, h);
 
     const edgePxCount = edges.reduce((s, v) => s + v, 0);
-    if (edgePxCount === 0) return fail('no_edges', { irisRad: irisRad.toFixed(1) });
+    if (edgePxCount === 0) return _fail('pure', inp, 'no_edges', { irisRad: irisRad.toFixed(1) });
 
     // Chain tracing — admit ≥ 3
     const visited  = new Uint8Array(w * h);
@@ -111,8 +113,10 @@ window.PupilAlgos['pure'] = {
 
     const segsGeMinseg = segments.filter(s => s.length >= MIN_SEG_LEN).length;
     if (segsGeMinseg === 0)
-      return fail('no_segments_ge_minseg', { totalSegs: segments.length, edgePxCount,
-        maxSegLen: segments.length ? Math.max(...segments.map(s=>s.length)) : 0 });
+      return _fail('pure', inp, 'no_segments_ge_minseg', {
+        totalSegs: segments.length, edgePxCount,
+        maxSegLen: segments.length ? Math.max(...segments.map(s=>s.length)) : 0
+      });
 
     // Curvature filter — circumradius formula
     function segCurvatureR(pts) {
@@ -134,13 +138,15 @@ window.PupilAlgos['pure'] = {
     const arcSegs = segments.filter(seg => {
       if (seg.length < MIN_SEG_LEN) return false;
       const R = segCurvatureR(seg);
-      return R >= innerR * 0.4 && R <= outerR * 2.5;  // loosened from 0.5/2.0
+      return R >= innerR * 0.4 && R <= outerR * 2.5;
     });
 
     if (arcSegs.length === 0) {
       const Rs = segments.filter(s=>s.length>=MIN_SEG_LEN).map(s=>segCurvatureR(s).toFixed(1));
-      return fail('no_arc_segs', { segsGeMinseg, sampleRs: Rs.slice(0,10),
-        innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) });
+      return _fail('pure', inp, 'no_arc_segs', {
+        segsGeMinseg, sampleRs: Rs.slice(0,10),
+        innerR: innerR.toFixed(1), outerR: outerR.toFixed(1)
+      });
     }
 
     // Segment merging
@@ -178,8 +184,10 @@ window.PupilAlgos['pure'] = {
 
     const mergedGe6 = merged.filter(s => s.length >= 6);
     if (mergedGe6.length === 0)
-      return fail('no_merged_ge6', { arcSegCount: arcSegs.length, mergedCount: merged.length,
-        maxMergedLen: merged.length ? Math.max(...merged.map(s=>s.length)) : 0 });
+      return _fail('pure', inp, 'no_merged_ge6', {
+        arcSegCount: arcSegs.length, mergedCount: merged.length,
+        maxMergedLen: merged.length ? Math.max(...merged.map(s=>s.length)) : 0
+      });
 
     // Candidate generation
     let bestEl = null, bestScore = -1, bestPts = [];
@@ -193,16 +201,16 @@ window.PupilAlgos['pure'] = {
       const { a, b, cx: ex, cy: ey } = el;
       if (a < innerR || a > outerR) { nFailSize++; continue; }
       const dist = Math.hypot(ex - cx, ey - cy);
-      if (dist > outerR * 0.70) { nFailDist++; continue; }          // was 0.6
+      if (dist > outerR * 0.70) { nFailDist++; continue; }
       const aspect = b / (a + 1e-6);
-      if (aspect < 0.15) { nFailAspect++; continue; }               // was 0.25
+      if (aspect < 0.15) { nFailAspect++; continue; }
       const circ    = Math.PI * (3*(a+b) - Math.sqrt((3*a+b)*(a+3*b)));
       const arcComp = Math.min(1, (pts.length * 1.5) / (circ + 1));
       const score   = aspect * arcComp * (1 - dist/(outerR*0.70+1)) * Math.log(pts.length+1);
       if (score > bestScore) { bestScore = score; bestEl = el; bestPts = seg; }
     }
 
-    if (!bestEl) return fail('no_valid_ellipse',
+    if (!bestEl) return _fail('pure', inp, 'no_valid_ellipse',
       { nFitNull, nFailSize, nFailDist, nFailAspect,
         mergedGe6: mergedGe6.length, innerR: innerR.toFixed(1), outerR: outerR.toFixed(1) });
 
@@ -227,14 +235,40 @@ window.PupilAlgos['pure'] = {
     }
     U.drawCircle(dbg, w, h, ex, ey, pupilR, [0, 255, 220, 220]);
 
-    return { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
-             debugPixels: dbg, failStage: null };
+    const out = { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
+                  debugPixels: dbg, failStage: null };
+    _silentLog('pure', inp, out);
+    return out;
   }
 };
 
-function fail(stage, detail = {}) {
-  return { pupilRadPx: null, pupilMm: null, confidence: 0,
-           debugPixels: null, failStage: stage, failDetail: detail };
+// ── Diagnostic helpers ────────────────────────────────────────────────────────
+
+function _fail(algoId, inp, stage, detail = {}) {
+  const out = { pupilRadPx: null, pupilMm: null, confidence: 0,
+                debugPixels: null, failStage: stage, failDetail: detail };
+  _silentLog(algoId, inp, out);
+  return out;
+}
+
+function _silentLog(algoId, inp, result) {
+  try {
+    if (!window._plTrialActive) return;
+    const row = {
+      t:          Date.now(),
+      algo:       algoId,
+      side:       inp._side || '?',
+      failStage:  result.failStage || null,
+      failDetail: result.failDetail || null,
+      conf:       result.confidence ?? null,
+      pupilMm:    result.pupilMm   ?? null,
+      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
+    };
+    const log = JSON.parse(localStorage.getItem('pl_algo_log') || '[]');
+    log.push(row);
+    if (log.length > 2000) log.splice(0, log.length - 2000);
+    localStorage.setItem('pl_algo_log', JSON.stringify(log));
+  } catch(e) { /* never throw */ }
 }
 
 })();

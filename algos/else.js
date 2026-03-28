@@ -182,14 +182,47 @@ window.PupilAlgos['else'] = {
 };
 
 // ── Diagnostic helpers ────────────────────────────────────────────────────────
+// In-memory ring buffer flushed to localStorage at most every 2s.
+// Avoids JSON.parse+stringify on every frame which would kill 30fps.
+// window._plLogBuf is shared across all algo IIFEs via the window object.
 
-function _fail(algoId, inp, stage, detail = {}) {
+function _fail(algoId, inp, stage, detail) {
+  if (detail === undefined) detail = {};
   const out = { pupilRadPx: null, pupilMm: null, confidence: 0,
                 debugPixels: null, failStage: stage, failDetail: detail };
   _silentLog(algoId, inp, out);
   return out;
 }
 
+function _silentLog(algoId, inp, result) {
+  try {
+    if (!window._plTrialActive) return;
+    if (!window._plLogBuf) window._plLogBuf = [];
+    window._plLogBuf.push({
+      t:          Date.now(),
+      algo:       algoId,
+      side:       inp._side || '?',
+      failStage:  result.failStage || null,
+      failDetail: result.failDetail || null,
+      conf:       result.confidence != null ? result.confidence : null,
+      pupilMm:    result.pupilMm   != null ? result.pupilMm   : null,
+      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
+    });
+    // Flush at most every 2000ms — batches all the per-frame writes
+    const now = Date.now();
+    if (!window._plLogLastFlush || now - window._plLogLastFlush > 2000) {
+      window._plLogLastFlush = now;
+      try {
+        const stored = localStorage.getItem('pl_algo_log');
+        const existing = stored ? JSON.parse(stored) : [];
+        const merged = existing.concat(window._plLogBuf);
+        if (merged.length > 2000) merged.splice(0, merged.length - 2000);
+        localStorage.setItem('pl_algo_log', JSON.stringify(merged));
+        window._plLogBuf = [];
+      } catch(e) { window._plLogBuf = []; /* quota exceeded — drop buffer */ }
+    }
+  } catch(e) { /* never throw from logger */ }
+}
 function _silentLog(algoId, inp, result) {
   try {
     if (!window._plTrialActive) return;

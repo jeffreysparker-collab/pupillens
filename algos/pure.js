@@ -284,24 +284,5 @@ function _silentLog(algoId, inp, result) {
     }
   } catch(e) { /* never throw from logger */ }
 }
-function _silentLog(algoId, inp, result) {
-  try {
-    if (!window._plTrialActive) return;
-    const row = {
-      t:          Date.now(),
-      algo:       algoId,
-      side:       inp._side || '?',
-      failStage:  result.failStage || null,
-      failDetail: result.failDetail || null,
-      conf:       result.confidence ?? null,
-      pupilMm:    result.pupilMm   ?? null,
-      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
-    };
-    const log = JSON.parse(localStorage.getItem('pl_algo_log') || '[]');
-    log.push(row);
-    if (log.length > 2000) log.splice(0, log.length - 2000);
-    localStorage.setItem('pl_algo_log', JSON.stringify(log));
-  } catch(e) { /* never throw */ }
-}
 
 })();

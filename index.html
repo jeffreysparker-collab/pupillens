@@ -600,6 +600,7 @@ function runAlgosOnEye(side, cx, cy, irisRadPx, upperLidY, lowerLidY, mmPerPx){
     upperLidY: upperLidY-srcY,
     lowerLidY: lowerLidY-srcY,
     mmPerPx,
+    _side: side,
   };
 
   // Run each selected algo
@@ -1205,8 +1206,23 @@ async function runDampingTrial(){
   endDampingTrial();
 }
 
+// Flush any remaining algo log buffer to localStorage at trial end
+function _flushAlgoLog(){
+  try{
+    const buf=window._plLogBuf;
+    if(!buf||!buf.length)return;
+    const stored=localStorage.getItem('pl_algo_log');
+    const existing=stored?JSON.parse(stored):[];
+    const merged=existing.concat(buf);
+    if(merged.length>2000)merged.splice(0,merged.length-2000);
+    localStorage.setItem('pl_algo_log',JSON.stringify(merged));
+    window._plLogBuf=[];
+    window._plLogLastFlush=Date.now();
+  }catch(e){}
+}
+
 function endDampingTrial(){
-  S.trialRunning=false;window._plTrialActive=false;currentPhase='';hideCountdown();setFlashRegion(true);
+  S.trialRunning=false;window._plTrialActive=false;_flushAlgoLog();currentPhase='';hideCountdown();setFlashRegion(true);
   $('cam').classList.remove('trial');
   $('trialBtn').disabled=$('colorBtn').disabled=$('dampBtn').disabled=false;
   $('dampBtn').classList.remove('running');
@@ -1215,7 +1231,7 @@ function endDampingTrial(){
   setStatus('TRACKING','on');
 }
 function endTrial(){
-  S.trialRunning=false;window._plTrialActive=false;currentPhase='';hideCountdown();setFlashRegion(true);
+  S.trialRunning=false;window._plTrialActive=false;_flushAlgoLog();currentPhase='';hideCountdown();setFlashRegion(true);
   $('cam').classList.remove('trial');
   $('trialBtn').disabled=$('colorBtn').disabled=$('dampBtn').disabled=false;
   $('trialBtn').classList.remove('running');$('trialBtn').textContent='▶ START PLR TRIAL';

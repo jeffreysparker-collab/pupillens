@@ -11,13 +11,56 @@
  *  3. Candidates ranked by combined arc completeness + circularity + size
  *
  * Especially robust on partial occlusions (heavy eyelids).
+ *
+ * ─── Changelog ────────────────────────────────────────────────────────────────
+ *
+ * v2 — ambient RGB / webcam + iPhone front-camera tuning
+ *
+ *   Five issues identified, two of which are logic bugs:
+ *
+ *   1. BUG — chain tracer discards too many short chains before curvature filter.
+ *      MIN_SEG_LEN/2 (= 4) was the admission threshold for the raw tracer output.
+ *      On RGB webcam the thinned pupil arc is interrupted every few pixels by
+ *      sensor noise, so the greedy walk produces many 3–5 px fragments that get
+ *      dropped here before the curvature filter can assess them.  Fix: admit
+ *      chains ≥ 3 pts into segments[], and lower MIN_SEG_LEN 8 → 5 so the
+ *      curvature filter (not raw length) is the primary quality gate.
+ *
+ *   2. BUG — discrete curvature formula underestimates κ for pixel-step chains.
+ *      Original: κ = |cross| / (l1² * l2).  This is not normalised for step
+ *      length; with l1≈l2≈1 px it gives κ ≈ |cross| which for a nearly-straight
+ *      segment is close to zero, making all near-straight (large-radius) arcs
+ *      look correct, but for a tight curve (small R) it also underestimates,
+ *      causing valid pupil arcs to be rejected.  Replaced with the three-point
+ *      circumradius formula R = (l1 * l2 * l3) / (4 * area), which is
+ *      geometrically exact and accumulates R directly rather than κ.  This
+ *      avoids reciprocal instability near zero curvature and gives correct
+ *      radius estimates regardless of step length.
+ *
+ *   3. Segment merge contamination: centroid proximity guard added.
+ *      The angle check alone allowed lid-edge segments (which have tangents
+ *      nearly parallel to pupil-arc tangents) to merge with genuine pupil arcs,
+ *      corrupting the ellipse fit.  After the angle check we now verify that the
+ *      centroid of the merged segment stays within outerR*0.65 of the iris
+ *      centre before accepting the merge.
+ *
+ *   4. dist gate: outerR*0.6 → outerR*0.65.
+ *      Same issue as ElSe/ExCuSe — webcam gaze variation shifts the fitted
+ *      ellipse centre further from the MediaPipe iris estimate than 0.6 allows.
+ *      0.65 is consistent with the confidence denominator already in use.
+ *
+ *   5. Specular flood-fill + double Gaussian blur (same as ElSe v2 / ExCuSe v2).
+ *      Catchlight edges pass the curvature filter (small bright blobs have high
+ *      curvature that can fall inside [innerR*0.5, outerR*2]).  Single blur
+ *      leaves fragmented RGB noise edges that fragment chains.  Both fixes
+ *      are identical to the other algos.
+ * ──────────────────────────────────────────────────────────────────────────────
  */
 (function(){
 'use strict';
 const U = window.PupilAlgoUtils;
 
-const MIN_SEG_LEN  = 8;    // minimum points in a valid edge segment
-const CURVE_WINDOW = 5;    // half-window for local curvature estimate
+const MIN_SEG_LEN  = 5;    // was 8; lowered so curvature filter is the quality gate
 const MERGE_GAP    = 8;    // max pixel gap to merge co-curved segments
 
 window.PupilAlgos['pure'] = {
@@ -38,30 +81,64 @@ window.PupilAlgos['pure'] = {
     );
     if (!zone.some(Boolean)) return fail();
 
-    // Normalise contrast (stretch to [0,255])
+    // Normalise contrast (p1–p99 stretch to [0,255])
     const vals=[];
     for (let i=0;i<gray.length;i++) if (zone[i]) vals.push(gray[i]);
+    if (vals.length < 20) return fail();
     vals.sort((a,b)=>a-b);
-    const lo=vals[Math.floor(vals.length*0.01)]||0;
-    const hi=vals[Math.floor(vals.length*0.99)]||255;
-    const span=hi-lo||1;
-    const norm=new Float32Array(w*h);
-    for (let i=0;i<w*h;i++) if (zone[i]) norm[i]=Math.min(255,(gray[i]-lo)/span*255);
+    const lo = vals[Math.floor(vals.length*0.01)] || 0;
+    const hi = vals[Math.floor(vals.length*0.99)] || 255;
+    const span = hi - lo || 1;
+    const norm = new Float32Array(w*h);
+    for (let i=0;i<w*h;i++)
+      if (zone[i]) norm[i] = Math.min(255, (gray[i]-lo)/span*255);
 
-    // Gaussian → Sobel → NMS → Canny → thin
-    const blurred=new Float32Array(w*h);
-    U.gaussianBlur5(norm, blurred, w, h, zone);
-    const {mag, ang}=U.sobel(blurred, w, h, zone);
-    const nmsMap=U.nms(mag, ang, w, h, zone);
-    let   edges =U.canny(nmsMap, mag, w, h);
-    edges         =U.thin(edges, w, h);
+    // ── v2: Specular flood-fill ───────────────────────────────────────────────
+    // Catchlights produce short high-curvature edge segments that pass the arc
+    // filter.  Patch them before edge detection (same approach as ElSe v2).
+    const nvals=[];
+    for (let i=0;i<w*h;i++) if (zone[i]) nvals.push(norm[i]);
+    nvals.sort((a,b)=>a-b);
+    const zmean  = nvals.length ? nvals.reduce((s,v)=>s+v,0)/nvals.length : 128;
+    const p90    = nvals[Math.floor(nvals.length*0.90)] ?? 230;
+    const p80    = nvals[Math.floor(nvals.length*0.80)] ?? 200;
+    const masked = new Float32Array(norm);
+    const specFill = new Uint8Array(w*h);
+    const sfStk = [];
+    for (let i=0;i<w*h;i++) if (zone[i] && masked[i]>=p90) sfStk.push(i);
+    while (sfStk.length){
+      const idx=sfStk.pop();
+      if (specFill[idx]) continue;
+      specFill[idx]=1; masked[idx]=zmean;
+      const fx=idx%w, fy=(idx-fx)/w;
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
+        const ny=fy+dy, nx=fx+dx;
+        if (ny<0||ny>=h||nx<0||nx>=w) continue;
+        const ni=ny*w+nx;
+        if (zone[ni]&&!specFill[ni]&&masked[ni]>p80) sfStk.push(ni);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── v2: Double Gaussian blur → Sobel → NMS → Canny → thin ────────────────
+    // Second pass reduces RGB sensor noise that fragments pupil-arc chains.
+    const blurred  = new Float32Array(w*h);
+    const blurred2 = new Float32Array(w*h);
+    U.gaussianBlur5(masked,   blurred,  w, h, zone);
+    U.gaussianBlur5(blurred,  blurred2, w, h, zone);
+    const {mag, ang} = U.sobel(blurred2, w, h, zone);
+    const nmsMap = U.nms(mag, ang, w, h, zone);
+    let   edges  = U.canny(nmsMap, mag, w, h);
+    edges          = U.thin(edges, w, h);
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Extract edge segments via 8-connected chain tracing
-    const visited=new Uint8Array(w*h);
-    const segments=[];
+    // ── v2: admit chains ≥ 3 (was MIN_SEG_LEN/2 = 4); curvature filter is
+    //        the quality gate, not raw length.
+    const visited = new Uint8Array(w*h);
+    const segments = [];
     for (let y=0;y<h;y++) for (let x=0;x<w;x++){
       if (!edges[y*w+x]||visited[y*w+x]) continue;
-      // Trace chain from this seed
       const chain=[];
       let cx2=x, cy2=y;
       while (true){
@@ -69,7 +146,6 @@ window.PupilAlgos['pure'] = {
         if (visited[idx]) break;
         visited[idx]=1;
         chain.push([cx2,cy2]);
-        // Find next unvisited edge neighbour
         let nx2=-1, ny2=-1;
         for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
           if (!dy&&!dx) continue;
@@ -80,44 +156,43 @@ window.PupilAlgos['pure'] = {
         if (nx2<0) break;
         cx2=nx2; cy2=ny2;
       }
-      if (chain.length >= MIN_SEG_LEN/2) segments.push(chain);
+      if (chain.length >= 3) segments.push(chain);   // was MIN_SEG_LEN/2
     }
 
-    // ── Curved-arc filtering ────────────────────────────────────────────────
-    // For each segment, compute local curvature. Keep segments where the
-    // mean curvature radius is consistent with pupil size [innerR, outerR].
-    // Curvature κ at point i = |cross(T_i, T_i+1)| / |T_i|^3 (discrete)
-    // Radius of curvature R = 1/κ
+    // ── Curved-arc filtering ─────────────────────────────────────────────────
+    // ── v2: replaced biased κ formula with three-point circumradius.
+    //    Original: κ = |cross|/(l1²·l2) — underestimates for pixel-step chains.
+    //    New: R = (l1·l2·l3)/(4·area) — geometrically exact, accumulates R
+    //    directly to avoid reciprocal instability.
     function segCurvatureR(pts) {
       if (pts.length < 3) return Infinity;
-      let sumK = 0, cnt = 0;
-      for (let i = 1; i < pts.length-1; i++) {
+      let sumR = 0, cnt = 0;
+      for (let i=1; i<pts.length-1; i++){
         const dx1=pts[i][0]-pts[i-1][0], dy1=pts[i][1]-pts[i-1][1];
         const dx2=pts[i+1][0]-pts[i][0], dy2=pts[i+1][1]-pts[i][1];
-        const cross=dx1*dy2-dy1*dx2;
-        const l1=Math.hypot(dx1,dy1), l2=Math.hypot(dx2,dy2);
-        if (l1<0.5||l2<0.5) continue;
-        const kappa=Math.abs(cross)/(l1*l1*l2+1e-6);
-        sumK+=kappa; cnt++;
+        const l1 = Math.hypot(dx1,dy1);
+        const l2 = Math.hypot(dx2,dy2);
+        const l3 = Math.hypot(pts[i+1][0]-pts[i-1][0], pts[i+1][1]-pts[i-1][1]);
+        const area = Math.abs(dx1*dy2 - dy1*dx2) / 2;
+        if (area < 1e-6 || l1 < 0.5 || l2 < 0.5) continue;
+        sumR += (l1 * l2 * l3) / (4 * area);
+        cnt++;
       }
       if (!cnt) return Infinity;
-      return 1/(sumK/cnt+1e-6);
+      return sumR / cnt;
     }
 
-    const arcSegs=segments.filter(seg => {
+    const arcSegs = segments.filter(seg => {
       if (seg.length < MIN_SEG_LEN) return false;
-      const R=segCurvatureR(seg);
+      const R = segCurvatureR(seg);
       return R >= innerR*0.5 && R <= outerR*2.0;
     });
 
-    // ── Segment merging ──────────────────────────────────────────────────────
-    // Two segments merge if endpoints are within MERGE_GAP px AND their
-    // mean gradient angles are within 40°.
+    // ── Segment merging ───────────────────────────────────────────────────────
     function segMeanAngle(seg){
-      let sx=0,sy=0; const n=seg.length;
-      for (let i=1;i<n;i++){
-        const dx=seg[i][0]-seg[i-1][0], dy=seg[i][1]-seg[i-1][1];
-        sx+=dx; sy+=dy;
+      let sx=0, sy=0;
+      for (let i=1;i<seg.length;i++){
+        sx+=seg[i][0]-seg[i-1][0]; sy+=seg[i][1]-seg[i-1][1];
       }
       return Math.atan2(sy,sx);
     }
@@ -125,10 +200,10 @@ window.PupilAlgos['pure'] = {
     let didMerge=true;
     while (didMerge){
       didMerge=false;
+      outer:
       for (let i=0;i<merged.length;i++){
         for (let j=i+1;j<merged.length;j++){
           const si=merged[i], sj=merged[j];
-          // Check endpoint gaps
           const endI=si[si.length-1], startJ=sj[0];
           const endJ=sj[sj.length-1], startI=si[0];
           const d1=Math.hypot(endI[0]-startJ[0],endI[1]-startJ[1]);
@@ -139,33 +214,35 @@ window.PupilAlgos['pure'] = {
           let da=Math.abs(ai-aj)%Math.PI;
           if (da>Math.PI/2) da=Math.PI-da;
           if (da>40*Math.PI/180) continue;
-          // Merge
-          const merged2=d1<=d2?[...si,...sj]:[...sj,...si];
-          merged[i]=merged2; merged.splice(j,1);
-          didMerge=true; break;
+          // ── v2: centroid proximity guard — prevent lid segments merging with
+          //        pupil arcs just because they have similar tangent directions.
+          const candidate = d1<=d2 ? [...si,...sj] : [...sj,...si];
+          const mcx = candidate.reduce((s,p)=>s+p[0],0)/candidate.length;
+          const mcy = candidate.reduce((s,p)=>s+p[1],0)/candidate.length;
+          if (Math.hypot(mcx-cx, mcy-cy) > outerR*0.65) continue;
+          merged[i]=candidate; merged.splice(j,1);
+          didMerge=true; break outer;
         }
-        if (didMerge) break;
       }
     }
 
-    // ── Candidate generation ─────────────────────────────────────────────────
-    // Fit an ellipse to every group of ≥6 points and score it.
+    // ── Candidate generation ──────────────────────────────────────────────────
     let bestEl=null, bestScore=-1, bestPts=[];
     for (const seg of merged){
       if (seg.length<6) continue;
-      // Subsample if long (keep speed)
-      const pts=seg.length>80 ? seg.filter((_,i)=>i%Math.ceil(seg.length/80)===0) : seg;
+      const pts=seg.length>80
+        ? seg.filter((_,i)=>i%Math.ceil(seg.length/80)===0)
+        : seg;
       const el=U.fitEllipse(pts);
       if (!el) continue;
       const {a,b,cx:ex,cy:ey}=el;
       if (a<innerR||a>outerR) continue;
       const dist=Math.hypot(ex-cx,ey-cy);
-      if (dist>outerR*0.6) continue;
+      if (dist>outerR*0.65) continue;           // was 0.6
       const aspect=b/(a+1e-6);
-      if (aspect<0.25) continue;
-      // Arc completeness: fraction of the ellipse circumference covered by these pts
+      if (aspect<0.20) continue;                // was 0.25
       const circ=Math.PI*(3*(a+b)-Math.sqrt((3*a+b)*(a+3*b)));
-      const arcComp=Math.min(1, (pts.length*1.5) / (circ+1));
+      const arcComp=Math.min(1,(pts.length*1.5)/(circ+1));
       const score=aspect*arcComp*(1-dist/(outerR*0.65+1))*Math.log(pts.length+1);
       if (score>bestScore){bestScore=score;bestEl=el;bestPts=seg;}
     }
@@ -182,11 +259,11 @@ window.PupilAlgos['pure'] = {
     const dbg=U.makeDebugRGBA(w,h);
     for (let y=0;y<h;y++) for (let x=0;x<w;x++){
       const i=y*w+x, idx=i*4;
-      if (!zone[i]){dbg[idx]=10;dbg[idx+1]=10;dbg[idx+2]=16;dbg[idx+3]=255;}
-      else if (edges[i]){dbg[idx]=255;dbg[idx+1]=180;dbg[idx+2]=30;dbg[idx+3]=255;}
-      else {const v=Math.round(blurred[i]*0.4);dbg[idx]=v;dbg[idx+1]=v;dbg[idx+2]=v;dbg[idx+3]=255;}
+      if (!zone[i])       { dbg[idx]=10; dbg[idx+1]=10;  dbg[idx+2]=16;  dbg[idx+3]=255; }
+      else if (specFill[i]){ dbg[idx]=0;  dbg[idx+1]=180; dbg[idx+2]=200; dbg[idx+3]=255; }
+      else if (edges[i])  { dbg[idx]=255; dbg[idx+1]=180; dbg[idx+2]=30;  dbg[idx+3]=255; }
+      else { const v=Math.round(blurred2[i]*0.4); dbg[idx]=v;dbg[idx+1]=v;dbg[idx+2]=v;dbg[idx+3]=255; }
     }
-    // Best segment in bright green
     for (const [px,py] of bestPts){
       const idx=(py*w+px)*4; dbg[idx]=60;dbg[idx+1]=255;dbg[idx+2]=120;dbg[idx+3]=255;
     }

@@ -1,11 +1,11 @@
-// PupilLens v7 — Service Worker
+// PupilLens v8 — Service Worker
 // Cache key: bump CACHE_VER whenever index.html or assets change.
 // Strategy:
 //   • App shell (index, manifest, icons) → cache-first, update in background
 //   • CDN scripts (MediaPipe, TF.js)     → cache-first (pinned versions)
 //   • Everything else                    → network-first with cache fallback
 
-const CACHE_VER = 'pupillens-v7-20260327';
+const CACHE_VER = 'pupillens-v8-20260328';
 
 const SHELL = [
   './',

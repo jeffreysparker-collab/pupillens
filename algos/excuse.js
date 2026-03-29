@@ -1,25 +1,43 @@
 /**
  * ExCuSe  —  Exclusion-Based Pupil Detection  (PupilExt port)
  * =============================================================
- * v2 — ambient RGB / webcam tuning (brightThr bug fixed, double blur, etc.)
+ * v2 — ambient RGB / webcam tuning (brightThr bug fixed, etc.)
  * v2.1 — failStage diagnostic + maximally loose gates
  * v2.2 — silent localStorage diagnostic logger (_silentLog)
+ * v2.3 — replaced double gaussianBlur5 with single inline 3×3 Gaussian
  *
- * ExCuSe is architecturally the best fit for ambient RGB because it works
- * from a dark-blob region rather than needing clean connected edges.  Gates
- * have been widened aggressively here; noisy measurements should be filtered
- * downstream with a Savitzky-Golay or median filter.
+ * At 6–10px pupil radius a 5×5 kernel (σ≈1px) already spans the full pupil
+ * boundary.  Two passes doubled the effective sigma and smeared the dark-blob
+ * boundary so the morphological close couldn't bridge it.  A 3×3 kernel
+ * (σ≈0.85px) kills 1px noise spikes without touching the pupil edge.
  *
- * Every return includes failStage: null on success, or a string:
+ * Every return includes failStage: null on success, or:
  *   "no_zone" | "no_cand_pixels" | "no_eroded_pixels" | "no_components" |
  *   "no_component_near_centre" | "hull_lt6" | "aspect_or_size" | null
- *
- * Diagnostic log: written to localStorage key 'pl_algo_log' only during trials
- * (when window._plTrialActive === true). Download via the Algo Log button in app.
  */
 (function(){
 'use strict';
 const U = window.PupilAlgoUtils;
+
+// Inline 3×3 Gaussian blur  [1 2 1 / 2 4 2 / 1 2 1] × (1/16)
+// Operates only on zone pixels; out-of-zone pixels stay 0.
+function blur3(src, dst, w, h, zone) {
+  const K = [1,2,1, 2,4,2, 1,2,1];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (!zone[i]) { dst[i] = 0; continue; }
+    let s = 0, wt = 0;
+    for (let ky = -1; ky <= 1; ky++) for (let kx = -1; kx <= 1; kx++) {
+      const ny = y + ky, nx = x + kx;
+      if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+      const ni = ny * w + nx;
+      const k  = K[(ky + 1) * 3 + (kx + 1)];
+      s  += src[ni] * k;
+      wt += k;
+    }
+    dst[i] = s / wt;
+  }
+}
 
 window.PupilAlgos['excuse'] = {
   id:    'excuse',
@@ -39,29 +57,26 @@ window.PupilAlgos['excuse'] = {
     );
     if (!zone.some(Boolean)) return _fail('excuse', inp, 'no_zone');
 
-    // Double blur
-    const blurred  = new Float32Array(w * h);
-    const blurred2 = new Float32Array(w * h);
-    U.gaussianBlur5(gray,    blurred,  w, h, zone);
-    U.gaussianBlur5(blurred, blurred2, w, h, zone);
+    // v2.3: single 3×3 blur — correct scale for 6–10px pupils
+    const blurred = new Float32Array(w * h);
+    blur3(gray, blurred, w, h, zone);
 
-    // Thresholds — loosened for ambient RGB
-    const darkThr   = U.percentile(blurred2, zone, 35);
-    const brightThr = U.percentile(blurred2, zone, 70);
+    const darkThr   = U.percentile(blurred, zone, 35);
+    const brightThr = U.percentile(blurred, zone, 70);
 
-    // Candidate mask: dark AND not a catchlight
+    // Candidate mask: dark AND not a catchlight (brightThr was a bug in v1 — not applied)
     const cand = new Uint8Array(w * h);
     let candCount = 0;
     for (let i = 0; i < w * h; i++) {
       if (!zone[i]) continue;
-      if (blurred2[i] <= darkThr && blurred2[i] < brightThr) { cand[i] = 1; candCount++; }
+      if (blurred[i] <= darkThr && blurred[i] < brightThr) { cand[i] = 1; candCount++; }
     }
     if (candCount === 0) return _fail('excuse', inp, 'no_cand_pixels', {
       darkThr: darkThr.toFixed(1), brightThr: brightThr.toFixed(1)
     });
 
-    // Gradient exclusion
-    const { mag } = U.sobel(blurred2, w, h, zone);
+    // Gradient exclusion outside pupil zone
+    const { mag } = U.sobel(blurred, w, h, zone);
     let maxG = 0;
     for (let i = 0; i < w * h; i++) maxG = Math.max(maxG, mag[i]);
     const edgeThr = maxG * 0.25;
@@ -71,7 +86,7 @@ window.PupilAlgos['excuse'] = {
         cand[y * w + x] = 0;
     }
 
-    // Morphological close
+    // Morphological close (5×5 dilate then 5×5 erode)
     const closed = new Uint8Array(w * h);
     for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
       if (!cand[y * w + x]) continue;
@@ -114,7 +129,7 @@ window.PupilAlgos['excuse'] = {
     }
     if (!nlbls) return _fail('excuse', inp, 'no_components', { erodedCount });
 
-    // Score — distance gate widened to outerR*0.75
+    // Score components — distance gate 0.75×outerR
     let best = null, bestScore = -1;
     const compDetails = [];
     for (let l = 0; l < nlbls; l++) {
@@ -146,10 +161,10 @@ window.PupilAlgos['excuse'] = {
 
     const el = U.fitEllipse(hull);
     if (!el) {
-      // Circular fallback — always return something
+      // Circular fallback — always return something if blob found
       const r    = Math.sqrt(compSz[best] / Math.PI);
       const conf = Math.max(0, 0.35 - Math.hypot(mx - cx, my - cy) / (outerR + 1));
-      const dbg  = buildDebug(w, h, zone, blurred2, eroded, best, label, mx, my, r, null);
+      const dbg  = buildDebug(w, h, zone, blurred, eroded, best, label, mx, my, r, null);
       const out  = { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
                      debugPixels: dbg, failStage: null };
       _silentLog('excuse', inp, out);
@@ -168,7 +183,7 @@ window.PupilAlgos['excuse'] = {
     const dist2 = Math.hypot(ex - cx, ey - cy);
     const conf  = Math.min(1, aspect) * Math.max(0, 1 - dist2 / (outerR * 0.75));
 
-    const dbg = buildDebug(w, h, zone, blurred2, eroded, best, label, ex, ey, pupilR, hull);
+    const dbg = buildDebug(w, h, zone, blurred, eroded, best, label, ex, ey, pupilR, hull);
     const out = { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
                   debugPixels: dbg, failStage: null };
     _silentLog('excuse', inp, out);
@@ -176,7 +191,7 @@ window.PupilAlgos['excuse'] = {
   }
 };
 
-function buildDebug(w, h, zone, blurred2, eroded, bestLbl, label, cx, cy, r, hull) {
+function buildDebug(w, h, zone, blurred, eroded, bestLbl, label, cx, cy, r, hull) {
   const dbg = U.makeDebugRGBA(w, h);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const i = y * w + x, idx = i * 4;
@@ -185,7 +200,7 @@ function buildDebug(w, h, zone, blurred2, eroded, bestLbl, label, cx, cy, r, hul
       const isB = label[i] === bestLbl + 1;
       dbg[idx]=isB?60:90; dbg[idx+1]=isB?255:60; dbg[idx+2]=isB?120:60; dbg[idx+3]=255;
     } else {
-      const v = Math.round(blurred2[i] * 0.4);
+      const v = Math.round(blurred[i] * 0.4);
       dbg[idx]=v; dbg[idx+1]=v; dbg[idx+2]=v; dbg[idx+3]=255;
     }
   }
@@ -196,11 +211,6 @@ function buildDebug(w, h, zone, blurred2, eroded, bestLbl, label, cx, cy, r, hul
   U.drawCircle(dbg, w, h, cx, cy, r, [0, 255, 220, 220]);
   return dbg;
 }
-
-// ── Diagnostic helpers ────────────────────────────────────────────────────────
-// In-memory ring buffer flushed to localStorage at most every 2s.
-// Avoids JSON.parse+stringify on every frame which would kill 30fps.
-// window._plLogBuf is shared across all algo IIFEs via the window object.
 
 function _fail(algoId, inp, stage, detail) {
   if (detail === undefined) detail = {};
@@ -224,20 +234,19 @@ function _silentLog(algoId, inp, result) {
       pupilMm:    result.pupilMm   != null ? result.pupilMm   : null,
       irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
     });
-    // Flush at most every 2000ms — batches all the per-frame writes
     const now = Date.now();
     if (!window._plLogLastFlush || now - window._plLogLastFlush > 2000) {
       window._plLogLastFlush = now;
       try {
         const stored = localStorage.getItem('pl_algo_log');
         const existing = stored ? JSON.parse(stored) : [];
-        const merged = existing.concat(window._plLogBuf);
-        if (merged.length > 2000) merged.splice(0, merged.length - 2000);
-        localStorage.setItem('pl_algo_log', JSON.stringify(merged));
+        const next = existing.concat(window._plLogBuf);
+        if (next.length > 2000) next.splice(0, next.length - 2000);
+        localStorage.setItem('pl_algo_log', JSON.stringify(next));
         window._plLogBuf = [];
-      } catch(e) { window._plLogBuf = []; /* quota exceeded — drop buffer */ }
+      } catch(e) { window._plLogBuf = []; }
     }
-  } catch(e) { /* never throw from logger */ }
+  } catch(e) {}
 }
 
 })();

@@ -4,6 +4,7 @@
  * v2 — ambient RGB / webcam tuning (see else.js changelog)
  * v2.1 — added failStage diagnostic to return object
  * v2.2 — silent localStorage diagnostic logger (_silentLog)
+ * v2.3 — replaced gaussianBlur5 with inline 3×3 Gaussian (same fix as excuse/pure/starburst)
  *
  * Every return now includes failStage: null on success, or a string
  * describing exactly where the algo gave up, e.g.:
@@ -17,6 +18,26 @@
 (function(){
 'use strict';
 const U = window.PupilAlgoUtils;
+
+// Inline 3×3 Gaussian  [1 2 1 / 2 4 2 / 1 2 1] × (1/16)
+// Correct scale for 6–10px pupils — 5×5 smears the boundary gradient away.
+function blur3(src, dst, w, h, zone) {
+  const K = [1,2,1, 2,4,2, 1,2,1];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (!zone[i]) { dst[i] = 0; continue; }
+    let s = 0, wt = 0;
+    for (let ky = -1; ky <= 1; ky++) for (let kx = -1; kx <= 1; kx++) {
+      const ny = y + ky, nx = x + kx;
+      if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+      const ni = ny * w + nx;
+      const k  = K[(ky + 1) * 3 + (kx + 1)];
+      s  += src[ni] * k;
+      wt += k;
+    }
+    dst[i] = s / wt;
+  }
+}
 
 window.PupilAlgos['else'] = {
   id:    'else',
@@ -72,13 +93,10 @@ window.PupilAlgos['else'] = {
       }
     }
 
-    // Blur — single pass only for now (double blur eats pupil edge on small crops)
+    // v2.3: single 3×3 blur — preserves edge sharpness at 6–10px pupil scale
     const blurred  = new Float32Array(w * h);
-    const blurred2 = new Float32Array(w * h);
-    U.gaussianBlur5(masked, blurred, w, h, zone);
-    // U.gaussianBlur5(blurred, blurred2, w, h, zone);  // TODO: re-enable if noise is a problem
-    blurred2.set(blurred);
-    const { mag, ang } = U.sobel(blurred2, w, h, zone);
+    blur3(masked, blurred, w, h, zone);
+    const { mag, ang } = U.sobel(blurred, w, h, zone);
     const nmsMap = U.nms(mag, ang, w, h, zone);
     let   edges  = U.canny(nmsMap, mag, w, h);
     edges          = U.thin(edges, w, h);
@@ -120,8 +138,8 @@ window.PupilAlgos['else'] = {
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       if (!zone[y * w + x]) continue;
       const dx = x - cx, dy = y - cy, r2 = dx * dx + dy * dy;
-      if (r2 < ir2)               { iS += blurred2[y * w + x]; iC++; }
-      else if (r2 <= outerR ** 2) { oS += blurred2[y * w + x]; oC++; }
+      if (r2 < ir2)               { iS += blurred[y * w + x]; iC++; }
+      else if (r2 <= outerR ** 2) { oS += blurred[y * w + x]; oC++; }
     }
     const innerDarker = (iC && oC) && iS / iC < oS / oC - 1.5;
 
@@ -169,7 +187,7 @@ window.PupilAlgos['else'] = {
       if (!zone[i])    { dbg[idx]=10; dbg[idx+1]=10;  dbg[idx+2]=16;  dbg[idx+3]=255; continue; }
       if (specFill[i]) { dbg[idx]=0;  dbg[idx+1]=180; dbg[idx+2]=200; dbg[idx+3]=255; continue; }
       if (edges[i])    { dbg[idx]=255;dbg[idx+1]=180; dbg[idx+2]=30;  dbg[idx+3]=255; continue; }
-      const v = Math.round(blurred2[i] * 0.4);
+      const v = Math.round(blurred[i] * 0.4);
       dbg[idx]=v; dbg[idx+1]=v; dbg[idx+2]=v; dbg[idx+3]=255;
     }
     for (const [px, py] of best.pts) {

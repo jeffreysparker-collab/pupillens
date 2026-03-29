@@ -1,16 +1,18 @@
 /**
  * PuRe  —  Pure Edge-Based Pupil Detection  (PupilExt port)
  * ===========================================================
- * v2 — ambient RGB / webcam tuning (curvature fix, spec fill, double blur etc.)
+ * v2 — ambient RGB / webcam tuning (curvature fix, spec fill, etc.)
  * v2.1 — failStage diagnostic
  * v2.2 — silent localStorage diagnostic logger (_silentLog)
+ * v2.3 — replaced double gaussianBlur5 with single inline 3×3 Gaussian
  *
- * Every return includes failStage: null on success, or a string:
+ * At 6–10px pupil radius a 5×5 kernel already spans the full boundary.
+ * Two passes smeared the pupil edge so wide that NMS suppressed it entirely.
+ * A 3×3 kernel kills pixel noise without touching the gradient peak.
+ *
+ * Every return includes failStage: null on success, or:
  *   "no_zone" | "no_edges" | "no_segments_ge_minseg" | "no_arc_segs" |
  *   "no_merged_ge6" | "no_valid_ellipse" | null
- *
- * Diagnostic log: written to localStorage key 'pl_algo_log' only during trials
- * (when window._plTrialActive === true). Download via the Algo Log button in app.
  */
 (function(){
 'use strict';
@@ -18,6 +20,25 @@ const U = window.PupilAlgoUtils;
 
 const MIN_SEG_LEN = 5;
 const MERGE_GAP   = 8;
+
+// Inline 3×3 Gaussian  [1 2 1 / 2 4 2 / 1 2 1] × (1/16)
+function blur3(src, dst, w, h, zone) {
+  const K = [1,2,1, 2,4,2, 1,2,1];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (!zone[i]) { dst[i] = 0; continue; }
+    let s = 0, wt = 0;
+    for (let ky = -1; ky <= 1; ky++) for (let kx = -1; kx <= 1; kx++) {
+      const ny = y + ky, nx = x + kx;
+      if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+      const ni = ny * w + nx;
+      const k  = K[(ky + 1) * 3 + (kx + 1)];
+      s  += src[ni] * k;
+      wt += k;
+    }
+    dst[i] = s / wt;
+  }
+}
 
 window.PupilAlgos['pure'] = {
   id:    'pure',
@@ -37,19 +58,19 @@ window.PupilAlgos['pure'] = {
     );
     if (!zone.some(Boolean)) return _fail('pure', inp, 'no_zone');
 
-    // p1-p99 stretch
+    // p1–p99 contrast stretch
     const vals = [];
     for (let i = 0; i < gray.length; i++) if (zone[i]) vals.push(gray[i]);
     if (vals.length < 20) return _fail('pure', inp, 'no_zone');
     vals.sort((a, b) => a - b);
-    const lo = vals[Math.floor(vals.length * 0.01)] || 0;
-    const hi = vals[Math.floor(vals.length * 0.99)] || 255;
+    const lo   = vals[Math.floor(vals.length * 0.01)] || 0;
+    const hi   = vals[Math.floor(vals.length * 0.99)] || 255;
     const span = hi - lo || 1;
     const norm = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++)
       if (zone[i]) norm[i] = Math.min(255, (gray[i] - lo) / span * 255);
 
-    // Specular flood-fill
+    // Specular flood-fill on normalised image
     const nv = [];
     for (let i = 0; i < w * h; i++) if (zone[i]) nv.push(norm[i]);
     nv.sort((a, b) => a - b);
@@ -73,20 +94,21 @@ window.PupilAlgos['pure'] = {
       }
     }
 
-    // Double blur → edges
-    const blurred  = new Float32Array(w * h);
-    const blurred2 = new Float32Array(w * h);
-    U.gaussianBlur5(masked,  blurred,  w, h, zone);
-    U.gaussianBlur5(blurred, blurred2, w, h, zone);
-    const { mag, ang } = U.sobel(blurred2, w, h, zone);
+    // v2.3: single 3×3 blur — preserves edge sharpness at 6–10px pupil scale
+    const blurred = new Float32Array(w * h);
+    blur3(masked, blurred, w, h, zone);
+
+    const { mag, ang } = U.sobel(blurred, w, h, zone);
     const nmsMap = U.nms(mag, ang, w, h, zone);
     let   edges  = U.canny(nmsMap, mag, w, h);
     edges          = U.thin(edges, w, h);
 
     const edgePxCount = edges.reduce((s, v) => s + v, 0);
-    if (edgePxCount === 0) return _fail('pure', inp, 'no_edges', { irisRad: irisRad.toFixed(1) });
+    if (edgePxCount === 0) return _fail('pure', inp, 'no_edges', {
+      irisRad: irisRad.toFixed(1)
+    });
 
-    // Chain tracing — admit ≥ 3
+    // Chain tracing — admit ≥ 3 pts
     const visited  = new Uint8Array(w * h);
     const segments = [];
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -115,18 +137,18 @@ window.PupilAlgos['pure'] = {
     if (segsGeMinseg === 0)
       return _fail('pure', inp, 'no_segments_ge_minseg', {
         totalSegs: segments.length, edgePxCount,
-        maxSegLen: segments.length ? Math.max(...segments.map(s=>s.length)) : 0
+        maxSegLen: segments.length ? Math.max(...segments.map(s => s.length)) : 0
       });
 
-    // Curvature filter — circumradius formula
+    // Curvature filter — three-point circumradius (geometrically exact)
     function segCurvatureR(pts) {
       if (pts.length < 3) return Infinity;
       let sumR = 0, cnt = 0;
       for (let i = 1; i < pts.length - 1; i++) {
         const dx1 = pts[i][0]-pts[i-1][0], dy1 = pts[i][1]-pts[i-1][1];
         const dx2 = pts[i+1][0]-pts[i][0],  dy2 = pts[i+1][1]-pts[i][1];
-        const l1 = Math.hypot(dx1, dy1), l2 = Math.hypot(dx2, dy2);
-        const l3 = Math.hypot(pts[i+1][0]-pts[i-1][0], pts[i+1][1]-pts[i-1][1]);
+        const l1   = Math.hypot(dx1, dy1), l2 = Math.hypot(dx2, dy2);
+        const l3   = Math.hypot(pts[i+1][0]-pts[i-1][0], pts[i+1][1]-pts[i-1][1]);
         const area = Math.abs(dx1 * dy2 - dy1 * dx2) / 2;
         if (area < 1e-6 || l1 < 0.5 || l2 < 0.5) continue;
         sumR += (l1 * l2 * l3) / (4 * area);
@@ -142,14 +164,15 @@ window.PupilAlgos['pure'] = {
     });
 
     if (arcSegs.length === 0) {
-      const Rs = segments.filter(s=>s.length>=MIN_SEG_LEN).map(s=>segCurvatureR(s).toFixed(1));
+      const Rs = segments.filter(s => s.length >= MIN_SEG_LEN)
+                         .map(s => segCurvatureR(s).toFixed(1));
       return _fail('pure', inp, 'no_arc_segs', {
-        segsGeMinseg, sampleRs: Rs.slice(0,10),
+        segsGeMinseg, sampleRs: Rs.slice(0, 10),
         innerR: innerR.toFixed(1), outerR: outerR.toFixed(1)
       });
     }
 
-    // Segment merging
+    // Segment merging with centroid proximity guard
     function segMeanAngle(seg) {
       let sx = 0, sy = 0;
       for (let i = 1; i < seg.length; i++) {
@@ -173,9 +196,9 @@ window.PupilAlgos['pure'] = {
           if (da > Math.PI / 2) da = Math.PI - da;
           if (da > 40 * Math.PI / 180) continue;
           const candidate = d1 <= d2 ? [...si, ...sj] : [...sj, ...si];
-          const mcx = candidate.reduce((s,p)=>s+p[0],0)/candidate.length;
-          const mcy = candidate.reduce((s,p)=>s+p[1],0)/candidate.length;
-          if (Math.hypot(mcx-cx, mcy-cy) > outerR * 0.75) continue;
+          const mcx = candidate.reduce((s, p) => s + p[0], 0) / candidate.length;
+          const mcy = candidate.reduce((s, p) => s + p[1], 0) / candidate.length;
+          if (Math.hypot(mcx - cx, mcy - cy) > outerR * 0.75) continue;
           merged[i] = candidate; merged.splice(j, 1);
           didMerge = true; break outer;
         }
@@ -186,10 +209,10 @@ window.PupilAlgos['pure'] = {
     if (mergedGe6.length === 0)
       return _fail('pure', inp, 'no_merged_ge6', {
         arcSegCount: arcSegs.length, mergedCount: merged.length,
-        maxMergedLen: merged.length ? Math.max(...merged.map(s=>s.length)) : 0
+        maxMergedLen: merged.length ? Math.max(...merged.map(s => s.length)) : 0
       });
 
-    // Candidate generation
+    // Candidate scoring
     let bestEl = null, bestScore = -1, bestPts = [];
     let nFitNull = 0, nFailSize = 0, nFailDist = 0, nFailAspect = 0;
     for (const seg of merged) {
@@ -206,7 +229,7 @@ window.PupilAlgos['pure'] = {
       if (aspect < 0.15) { nFailAspect++; continue; }
       const circ    = Math.PI * (3*(a+b) - Math.sqrt((3*a+b)*(a+3*b)));
       const arcComp = Math.min(1, (pts.length * 1.5) / (circ + 1));
-      const score   = aspect * arcComp * (1 - dist/(outerR*0.70+1)) * Math.log(pts.length+1);
+      const score   = aspect * arcComp * (1 - dist / (outerR * 0.70 + 1)) * Math.log(pts.length + 1);
       if (score > bestScore) { bestScore = score; bestEl = el; bestPts = seg; }
     }
 
@@ -226,7 +249,7 @@ window.PupilAlgos['pure'] = {
       if (!zone[i])    { dbg[idx]=10; dbg[idx+1]=10;  dbg[idx+2]=16;  dbg[idx+3]=255; continue; }
       if (specFill[i]) { dbg[idx]=0;  dbg[idx+1]=180; dbg[idx+2]=200; dbg[idx+3]=255; continue; }
       if (edges[i])    { dbg[idx]=255;dbg[idx+1]=180; dbg[idx+2]=30;  dbg[idx+3]=255; continue; }
-      const v = Math.round(blurred2[i] * 0.4);
+      const v = Math.round(blurred[i] * 0.4);
       dbg[idx]=v; dbg[idx+1]=v; dbg[idx+2]=v; dbg[idx+3]=255;
     }
     for (const [px, py] of bestPts) {
@@ -241,11 +264,6 @@ window.PupilAlgos['pure'] = {
     return out;
   }
 };
-
-// ── Diagnostic helpers ────────────────────────────────────────────────────────
-// In-memory ring buffer flushed to localStorage at most every 2s.
-// Avoids JSON.parse+stringify on every frame which would kill 30fps.
-// window._plLogBuf is shared across all algo IIFEs via the window object.
 
 function _fail(algoId, inp, stage, detail) {
   if (detail === undefined) detail = {};
@@ -269,20 +287,19 @@ function _silentLog(algoId, inp, result) {
       pupilMm:    result.pupilMm   != null ? result.pupilMm   : null,
       irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
     });
-    // Flush at most every 2000ms — batches all the per-frame writes
     const now = Date.now();
     if (!window._plLogLastFlush || now - window._plLogLastFlush > 2000) {
       window._plLogLastFlush = now;
       try {
         const stored = localStorage.getItem('pl_algo_log');
         const existing = stored ? JSON.parse(stored) : [];
-        const merged = existing.concat(window._plLogBuf);
-        if (merged.length > 2000) merged.splice(0, merged.length - 2000);
-        localStorage.setItem('pl_algo_log', JSON.stringify(merged));
+        const next = existing.concat(window._plLogBuf);
+        if (next.length > 2000) next.splice(0, next.length - 2000);
+        localStorage.setItem('pl_algo_log', JSON.stringify(next));
         window._plLogBuf = [];
-      } catch(e) { window._plLogBuf = []; /* quota exceeded — drop buffer */ }
+      } catch(e) { window._plLogBuf = []; }
     }
-  } catch(e) { /* never throw from logger */ }
+  } catch(e) {}
 }
 
 })();

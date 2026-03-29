@@ -3,14 +3,15 @@
  * =====================================================
  * v7   — original
  * v7.1 — replaced gaussianBlur5 with inline 3×3 Gaussian
+ * v7.2 — added _silentLog + failStage diagnostics (was dropping frames silently)
  *
- * At 6–10px pupil radius a 5×5 kernel (σ≈1px) spans nearly the full pupil
- * boundary.  The resulting gradient peak is wide and low, making NMS more
- * likely to suppress it.  A 3×3 kernel (σ≈0.85px) removes 1px noise spikes
- * while keeping the edge peak sharp and detectable.
- *
- * Everything else unchanged — specular fill, connected-component filter,
- * 24-ray starburst, median + MAD quality gate.
+ * failStage values:
+ *   "no_zone_pixels"   — extractGray returned an empty zone
+ *   "no_specular_data" — fewer than 20 zone pixels (crop too small / OOB)
+ *   "no_hits"          — starburst found < 4 edge hits
+ *   "quality_gate"     — MAD/r > 0.20 (centre drifted, too few clean rays)
+ *   "radius_gate"      — median r outside [innerR, outerR]
+ *   null               — success
  */
 (function(){
 'use strict';
@@ -60,7 +61,8 @@ window.PupilAlgos['starburst'] = {
     // Specular flood-fill
     const zv = [];
     for (let i = 0; i < gray.length; i++) if (zone[i]) zv.push(gray[i]);
-    if (zv.length < 20) return fail();
+    if (zv.length < 20) return _fail('starburst', inp, 'no_specular_data',
+      { zonePixels: zv.length });
     zv.sort((a, b) => a - b);
     const zmean = zv.reduce((s, v) => s + v, 0) / zv.length;
     const p90   = zv[Math.floor(zv.length * 0.90)];
@@ -82,7 +84,6 @@ window.PupilAlgos['starburst'] = {
       }
     }
 
-    // v7.1: single 3×3 blur — preserves gradient peak at small pupil scale
     const blurred = new Float32Array(w * h);
     blur3(masked, blurred, w, h, zone);
 
@@ -118,18 +119,19 @@ window.PupilAlgos['starburst'] = {
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       if (!zone[y * w + x]) continue;
       const dx = x - cx, dy = y - cy, r2 = dx * dx + dy * dy;
-      if (r2 < innerR2)                  { iS += blurred[y * w + x]; iC++; }
-      else if (r2 <= outerRmm ** 2)      { oS += blurred[y * w + x]; oC++; }
+      if (r2 < innerR2)               { iS += blurred[y * w + x]; iC++; }
+      else if (r2 <= outerRmm ** 2)   { oS += blurred[y * w + x]; oC++; }
     }
     const innerDarker = (iC && oC) ? iS / iC < oS / oC - 5 : false;
 
     const goodLbl = new Uint8Array(nlbls + 1);
+    let goodLblCount = 0;
     for (let l = 1; l <= nlbls; l++) {
       if (csz[l-1] < 5) continue;
       const mx2 = scx[l-1] / csz[l-1], my2 = scy[l-1] / csz[l-1];
       const d = Math.hypot(mx2 - cx, my2 - cy);
       if (d > (innerDarker ? irisRad * 0.55 : irisRad * 0.35)) continue;
-      goodLbl[l] = 1;
+      goodLbl[l] = 1; goodLblCount++;
     }
     const goodEdge = new Uint8Array(w * h);
     for (let i = 0; i < w * h; i++) if (label[i] && goodLbl[label[i]]) goodEdge[i] = 1;
@@ -151,18 +153,34 @@ window.PupilAlgos['starburst'] = {
         }
       }
     }
-    if (hitX.length < 4) return fail();
+    if (hitX.length < 4) return _fail('starburst', inp, 'no_hits', {
+      hits: hitX.length,
+      goodLabels: goodLblCount,
+      innerDarker,
+      innerR: innerR.toFixed(1),
+      outerR: outerR.toFixed(1),
+      irisRad: irisRad.toFixed(1),
+    });
 
     // Median radius + MAD quality gate
     const radii   = hitX.map((x, i) => Math.hypot(x - cx, hitY[i] - cy));
     const r       = U.median(radii);
-    if (r == null) return fail();
+    if (r == null) return _fail('starburst', inp, 'no_hits', { hits: hitX.length, median: null });
+
     const mad     = U.mad(radii, r);
     const quality = r > 0 ? mad / r : 1;
-    if (quality > QUALITY_MAX || r < innerR || r > outerR) return fail();
+
+    if (quality > QUALITY_MAX) return _fail('starburst', inp, 'quality_gate', {
+      quality: quality.toFixed(3), threshold: QUALITY_MAX,
+      r: r.toFixed(1), mad: mad.toFixed(1), hits: hitX.length,
+    });
+    if (r < innerR || r > outerR) return _fail('starburst', inp, 'radius_gate', {
+      r: r.toFixed(1), innerR: innerR.toFixed(1), outerR: outerR.toFixed(1),
+    });
 
     const conf = Math.max(0, 1 - quality / QUALITY_MAX);
 
+    // Debug pixels
     const dbg = U.makeDebugRGBA(w, h);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       const i = y * w + x, idx = i * 4;
@@ -179,10 +197,48 @@ window.PupilAlgos['starburst'] = {
     });
     U.drawCircle(dbg, w, h, cx, cy, r, [0, 255, 220, 220]);
 
-    return { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf, debugPixels: dbg };
+    const out = { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
+                  debugPixels: dbg, failStage: null };
+    _silentLog('starburst', inp, out);
+    return out;
   }
 };
 
-function fail() { return { pupilRadPx: null, pupilMm: null, confidence: 0, debugPixels: null }; }
+function _fail(algoId, inp, stage, detail) {
+  if (detail === undefined) detail = {};
+  const out = { pupilRadPx: null, pupilMm: null, confidence: 0,
+                debugPixels: null, failStage: stage, failDetail: detail };
+  _silentLog(algoId, inp, out);
+  return out;
+}
+
+function _silentLog(algoId, inp, result) {
+  try {
+    if (!window._plTrialActive) return;
+    if (!window._plLogBuf) window._plLogBuf = [];
+    window._plLogBuf.push({
+      t:          Date.now(),
+      algo:       algoId,
+      side:       inp._side || '?',
+      failStage:  result.failStage  || null,
+      fallback:   result._fallback  || null,
+      conf:       result.confidence != null ? result.confidence : null,
+      pupilMm:    result.pupilMm    != null ? result.pupilMm   : null,
+      irisRad:    inp.irisRadPx     != null ? +inp.irisRadPx.toFixed(1) : null,
+    });
+    const now = Date.now();
+    if (!window._plLogLastFlush || now - window._plLogLastFlush > 2000) {
+      window._plLogLastFlush = now;
+      try {
+        const stored   = localStorage.getItem('pl_algo_log');
+        const existing = stored ? JSON.parse(stored) : [];
+        const next     = existing.concat(window._plLogBuf);
+        if (next.length > 2000) next.splice(0, next.length - 2000);
+        localStorage.setItem('pl_algo_log', JSON.stringify(next));
+        window._plLogBuf = [];
+      } catch(e) { window._plLogBuf = []; }
+    }
+  } catch(e) {}
+}
 
 })();

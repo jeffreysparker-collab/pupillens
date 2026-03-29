@@ -1,26 +1,33 @@
 /**
  * ExCuSe  —  Exclusion-Based Pupil Detection  (PupilExt port)
  * =============================================================
- * v2 — ambient RGB / webcam tuning (brightThr bug fixed, etc.)
+ * v2   — ambient RGB / webcam tuning (brightThr bug fixed, etc.)
  * v2.1 — failStage diagnostic + maximally loose gates
  * v2.2 — silent localStorage diagnostic logger (_silentLog)
  * v2.3 — replaced double gaussianBlur5 with single inline 3×3 Gaussian
+ * v2.4 — circular fallback when ellipse fails aspect/size gate
  *
- * At 6–10px pupil radius a 5×5 kernel (σ≈1px) already spans the full pupil
- * boundary.  Two passes doubled the effective sigma and smeared the dark-blob
- * boundary so the morphological close couldn't bridge it.  A 3×3 kernel
- * (σ≈0.85px) kills 1px noise spikes without touching the pupil edge.
+ * Root cause of 100% aspect_or_size failures (confirmed from algo_log):
+ *   fitEllipse() returns a degenerate near-line ellipse (aspect ≈ 0.10,
+ *   semi-major >> outerR) when the hull point set is collinear or sparse.
+ *   The gate correctly catches this but previously called _fail() and returned
+ *   null rather than falling back.  v2.4 falls through to the same circular
+ *   area estimate used when fitEllipse() returns null, with a confidence cap
+ *   of 0.40 to flag it as low-quality rather than discarding entirely.
+ *
+ * innerR gate unchanged — at 6–10px pupil radius innerR ≈ 5–7px, so the
+ * existing 0.4× floor (≈ 2–3px) already admits everything real.
  *
  * Every return includes failStage: null on success, or:
  *   "no_zone" | "no_cand_pixels" | "no_eroded_pixels" | "no_components" |
- *   "no_component_near_centre" | "hull_lt6" | "aspect_or_size" | null
+ *   "no_component_near_centre" | "hull_lt6" | null
+ *   (aspect_or_size no longer a terminal fail — demoted to circular fallback)
  */
 (function(){
 'use strict';
 const U = window.PupilAlgoUtils;
 
-// Inline 3×3 Gaussian blur  [1 2 1 / 2 4 2 / 1 2 1] × (1/16)
-// Operates only on zone pixels; out-of-zone pixels stay 0.
+// Inline 3×3 Gaussian  [1 2 1 / 2 4 2 / 1 2 1] × (1/16)
 function blur3(src, dst, w, h, zone) {
   const K = [1,2,1, 2,4,2, 1,2,1];
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -57,14 +64,12 @@ window.PupilAlgos['excuse'] = {
     );
     if (!zone.some(Boolean)) return _fail('excuse', inp, 'no_zone');
 
-    // v2.3: single 3×3 blur — correct scale for 6–10px pupils
     const blurred = new Float32Array(w * h);
     blur3(gray, blurred, w, h, zone);
 
     const darkThr   = U.percentile(blurred, zone, 35);
     const brightThr = U.percentile(blurred, zone, 70);
 
-    // Candidate mask: dark AND not a catchlight (brightThr was a bug in v1 — not applied)
     const cand = new Uint8Array(w * h);
     let candCount = 0;
     for (let i = 0; i < w * h; i++) {
@@ -146,6 +151,8 @@ window.PupilAlgos['excuse'] = {
       { nlbls, outerR: outerR.toFixed(1), innerR: innerR.toFixed(1), compDetails });
 
     const mx = compSx[best] / compSz[best], my = compSy[best] / compSz[best];
+
+    // Hull: one boundary point per angular sector
     const SECTORS = 36;
     const buckets = Array.from({ length: SECTORS }, () => null);
     for (const [px, py] of compPts[best]) {
@@ -155,37 +162,61 @@ window.PupilAlgos['excuse'] = {
       if (!buckets[si] || d > buckets[si].d) buckets[si] = { x: px, y: py, d };
     }
     const hull = buckets.filter(Boolean).map(b => [b.x, b.y]);
-    if (hull.length < 6) return _fail('excuse', inp, 'hull_lt6', {
-      hullLen: hull.length, compSz: compSz[best]
-    });
 
-    const el = U.fitEllipse(hull);
-    if (!el) {
-      // Circular fallback — always return something if blob found
+    // ── Circular area fallback ────────────────────────────────────────────
+    // Used when: hull < 6 pts, fitEllipse returns null, OR ellipse is
+    // degenerate (aspect < 0.15 or semi-axis outside [innerR*0.5, outerR]).
+    // Confidence capped at 0.40 to distinguish from a good ellipse fit.
+    const circularFallback = (reason, detail) => {
       const r    = Math.sqrt(compSz[best] / Math.PI);
-      const conf = Math.max(0, 0.35 - Math.hypot(mx - cx, my - cy) / (outerR + 1));
-      const dbg  = buildDebug(w, h, zone, blurred, eroded, best, label, mx, my, r, null);
-      const out  = { pupilRadPx: r, pupilMm: r * 2 * mmPerPx, confidence: conf,
-                     debugPixels: dbg, failStage: null };
+      // Clamp to plausible range — if area blob is itself too big, clip to outerR
+      const rClamped = Math.min(r, outerR);
+      const dist = Math.hypot(mx - cx, my - cy);
+      const conf = Math.min(0.40, Math.max(0, 0.35 - dist / (outerR + 1)));
+      const dbg  = buildDebug(w, h, zone, blurred, eroded, best, label, mx, my, rClamped, null);
+      const out  = {
+        pupilRadPx:  rClamped,
+        pupilMm:     rClamped * 2 * mmPerPx,
+        confidence:  conf,
+        debugPixels: dbg,
+        failStage:   null,
+        _fallback:   reason,
+        _fallbackDetail: detail,
+      };
       _silentLog('excuse', inp, out);
       return out;
-    }
+    };
+
+    if (hull.length < 6) return circularFallback('hull_lt6', { hullLen: hull.length });
+
+    const el = U.fitEllipse(hull);
+    if (!el) return circularFallback('fitEllipse_null', {});
 
     const { a, b: bEl, cx: ex, cy: ey } = el;
     const pupilR = (a + bEl) / 2;
     const aspect = bEl / (a + 1e-6);
-    if (aspect < 0.15 || pupilR < innerR * 0.5 || pupilR > outerR * 1.1)
-      return _fail('excuse', inp, 'aspect_or_size', {
-        aspect: aspect.toFixed(2), pupilR: pupilR.toFixed(1),
-        innerR: innerR.toFixed(1), outerR: outerR.toFixed(1)
+
+    // Gate: if ellipse is degenerate, fall back to circular rather than failing
+    if (aspect < 0.15 || pupilR < innerR * 0.5 || pupilR > outerR) {
+      return circularFallback('ellipse_degenerate', {
+        aspect: aspect.toFixed(2),
+        pupilR: pupilR.toFixed(1),
+        innerR: innerR.toFixed(1),
+        outerR: outerR.toFixed(1),
       });
+    }
 
     const dist2 = Math.hypot(ex - cx, ey - cy);
     const conf  = Math.min(1, aspect) * Math.max(0, 1 - dist2 / (outerR * 0.75));
 
     const dbg = buildDebug(w, h, zone, blurred, eroded, best, label, ex, ey, pupilR, hull);
-    const out = { pupilRadPx: pupilR, pupilMm: pupilR * 2 * mmPerPx, confidence: conf,
-                  debugPixels: dbg, failStage: null };
+    const out = {
+      pupilRadPx:  pupilR,
+      pupilMm:     pupilR * 2 * mmPerPx,
+      confidence:  conf,
+      debugPixels: dbg,
+      failStage:   null,
+    };
     _silentLog('excuse', inp, out);
     return out;
   }
@@ -225,22 +256,22 @@ function _silentLog(algoId, inp, result) {
     if (!window._plTrialActive) return;
     if (!window._plLogBuf) window._plLogBuf = [];
     window._plLogBuf.push({
-      t:          Date.now(),
-      algo:       algoId,
-      side:       inp._side || '?',
-      failStage:  result.failStage || null,
-      failDetail: result.failDetail || null,
-      conf:       result.confidence != null ? result.confidence : null,
-      pupilMm:    result.pupilMm   != null ? result.pupilMm   : null,
-      irisRad:    inp.irisRadPx != null ? +inp.irisRadPx.toFixed(1) : null,
+      t:           Date.now(),
+      algo:        algoId,
+      side:        inp._side || '?',
+      failStage:   result.failStage  || null,
+      fallback:    result._fallback  || null,
+      conf:        result.confidence != null ? result.confidence : null,
+      pupilMm:     result.pupilMm    != null ? result.pupilMm   : null,
+      irisRad:     inp.irisRadPx     != null ? +inp.irisRadPx.toFixed(1) : null,
     });
     const now = Date.now();
     if (!window._plLogLastFlush || now - window._plLogLastFlush > 2000) {
       window._plLogLastFlush = now;
       try {
-        const stored = localStorage.getItem('pl_algo_log');
+        const stored   = localStorage.getItem('pl_algo_log');
         const existing = stored ? JSON.parse(stored) : [];
-        const next = existing.concat(window._plLogBuf);
+        const next     = existing.concat(window._plLogBuf);
         if (next.length > 2000) next.splice(0, next.length - 2000);
         localStorage.setItem('pl_algo_log', JSON.stringify(next));
         window._plLogBuf = [];

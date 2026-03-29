@@ -1,3 +1,4 @@
+
 // PupilLens v8 — Service Worker
 // Cache key: bump CACHE_VER whenever index.html or assets change.
 // Strategy:
@@ -5,7 +6,7 @@
 //   • CDN scripts (MediaPipe, TF.js)     → cache-first (pinned versions)
 //   • Everything else                    → network-first with cache fallback
 
-const CACHE_VER = 'pupillens-v8-20260329xx';
+const CACHE_VER = 'pupillens-v8-20260329x';
 
 const SHELL = [
   './',

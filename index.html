@@ -542,20 +542,25 @@ function renderAlgoResults(){
     container.innerHTML=''; return;
   }
   container.innerHTML='';
-  // Find best confidence
+  // Average L+R confidence to find best algo for highlighting
+  const avgConf=id=>{
+    const s=S.lastAlgoResults[id];
+    const lc=s?.L?.confidence??0, rc=s?.R?.confidence??0;
+    return (lc+rc)/2;
+  };
   let bestId=null, bestConf=-1;
   for(const id of S.selectedAlgos){
-    const r=S.lastAlgoResults[id];
-    if(r&&r.confidence>bestConf){bestConf=r.confidence;bestId=id;}
+    const c=avgConf(id); if(c>bestConf){bestConf=c;bestId=id;}
   }
   for(const id of S.selectedAlgos){
     const algo=window.PupilAlgos[id];
-    const r=S.lastAlgoResults[id];
+    const s=S.lastAlgoResults[id];
+    const lMm=s?.L?.pupilMm, rMm=s?.R?.pupilMm;
+    const mm=lMm!=null&&rMm!=null?((lMm+rMm)/2).toFixed(2):lMm?.toFixed(2)??rMm?.toFixed(2)??'—';
+    const conf=avgConf(id);
+    const cCls=conf>=0.7?'ok':conf>=0.4?'w':'bad';
     const row=document.createElement('div');
     row.className='algo-res-row'+(id===bestId?' best':'');
-    const mm=r?.pupilMm?.toFixed(2)??'—';
-    const conf=r?.confidence??0;
-    const cCls=conf>=0.7?'ok':conf>=0.4?'w':'bad';
     row.innerHTML=`<span class="arn">${algo.label}</span><span class="arv">${mm}mm</span><span class="arc ${cCls}">${(conf*100).toFixed(0)}%</span>`;
     container.appendChild(row);
   }
@@ -612,8 +617,11 @@ function runAlgosOnEye(side, cx, cy, irisRadPx, upperLidY, lowerLidY, mmPerPx){
     catch(e){ console.warn(`Algo ${id} error:`,e); results[id]={pupilRadPx:null,pupilMm:null,confidence:0,debugPixels:null}; }
   }
 
-  // Store for compare UI
-  for(const [id,r] of Object.entries(results)) S.lastAlgoResults[id]=r;
+  // Store for compare UI — keyed by side so L and R don't overwrite each other
+  for(const [id,r] of Object.entries(results)) {
+    if(!S.lastAlgoResults[id]) S.lastAlgoResults[id]={};
+    S.lastAlgoResults[id][side]=r;
+  }
 
   // Combine
   const valids=Object.values(results).filter(r=>r.pupilRadPx!=null&&r.confidence>0);
@@ -970,12 +978,18 @@ function updateUI(m){
   if(S.trialRunning&&currentPhase){
     const now=Date.now();
     const lPx=m.lPupilPx??0, rPx=m.rPupilPx??0;
-    // Snapshot per-algo results for this frame (both eyes)
+    // Snapshot per-algo results for this frame, both eyes
     const algoSnap={};
     for(const id of S.selectedAlgos){
-      const r=S.lastAlgoResults[id];
-      algoSnap[id]={lMm:r?.pupilMm??null, lConf:r?.confidence??null,
-                    rMm:null, rConf:null, failStage:r?.failStage??null};
+      const s=S.lastAlgoResults[id];
+      algoSnap[id]={
+        lMm:   s?.L?.pupilMm    ?? null,
+        lConf: s?.L?.confidence ?? null,
+        rMm:   s?.R?.pupilMm    ?? null,
+        rConf: s?.R?.confidence ?? null,
+        lFail: s?.L?.failStage  ?? null,
+        rFail: s?.R?.failStage  ?? null,
+      };
     }
     S.trialData.push({
       t_ms:now,
@@ -1400,9 +1414,10 @@ $('exportBtn').onclick=()=>{
   // Collect every algo id that appears in any row's algoSnap
   const algoIds=[...S.selectedAlgos];
 
-  // Build per-algo column headers: {algo}_l_mm, {algo}_l_conf, {algo}_fail
+  // Per-algo column headers: {algo}_l_mm, {algo}_l_conf, {algo}_l_fail, {algo}_r_mm, {algo}_r_conf, {algo}_r_fail
   const algoHeaders=algoIds.flatMap(id=>[
-    `${id}_l_mm`,`${id}_l_conf`,`${id}_fail`
+    `${id}_l_mm`,`${id}_l_conf`,`${id}_l_fail`,
+    `${id}_r_mm`,`${id}_r_conf`,`${id}_r_fail`,
   ]);
 
   const meta=[
@@ -1434,9 +1449,12 @@ $('exportBtn').onclick=()=>{
     const algoVals=algoIds.flatMap(id=>{
       const snap=d.algoSnap?.[id];
       return [
-        snap?.lMm!=null?snap.lMm.toFixed(3):'',
-        snap?.lConf!=null?snap.lConf.toFixed(3):'',
-        snap?.failStage||'',
+        snap?.lMm   != null ? snap.lMm.toFixed(3)   : '',
+        snap?.lConf != null ? snap.lConf.toFixed(3)  : '',
+        snap?.lFail || '',
+        snap?.rMm   != null ? snap.rMm.toFixed(3)    : '',
+        snap?.rConf != null ? snap.rConf.toFixed(3)  : '',
+        snap?.rFail || '',
       ];
     });
     return [...base,...algoVals].join(',');
